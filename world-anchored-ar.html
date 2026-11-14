@@ -78,6 +78,12 @@
     --danger: #ff6b7d;
     --safe-top: env(safe-area-inset-top, 0px);
     --safe-bottom: env(safe-area-inset-bottom, 0px);
+
+    /* Reset (↻) button position. Fine-tune here, e.g. to stay clear of the Needle App Clip's own button.
+       --reset-right is the gap to the right screen edge, added on top of the safe-area inset. */
+    --reset-right: 4px;
+    --reset-top: 0px;      /* nudge down (+) or up (-) from the score bar's first row */
+    --reset-size: 34px;
   }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   [hidden] { display: none !important; }
@@ -185,7 +191,18 @@
     border: 1px solid rgba(255,255,255,.18); background: rgba(255,255,255,.08); border-radius: 999px;
     height: 34px; min-width: 34px; padding: 0 10px; font-size: 16px; font-weight: 700; transition: background .2s, color .2s;
   }
-  .icon-btn.armed { background: var(--danger); color: #fff; border-color: transparent; font-size: 13px; }
+  .icon-btn.armed { background: var(--danger); color: #fff; border-color: transparent; }
+  #restartBtn {
+    position: absolute; z-index: 1;
+    right: calc(env(safe-area-inset-right, 0px) + var(--reset-right));
+    top: calc(var(--safe-top) + 8px + var(--reset-top));
+    width: var(--reset-size); height: var(--reset-size); min-width: 0; padding: 0;
+  }
+  /* The score bar's first row keeps clear of the button, so it never covers the count or timer. */
+  #hud .hud-row {
+    padding-right: max(0px, calc(env(safe-area-inset-right, 0px) + var(--reset-right) + var(--reset-size) + 8px - 12px));
+  }
+  .panel .scan-count { font-size: 12px; opacity: .8; }
   .slots { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; }
   .slot {
     width: var(--slot, 24px); height: var(--slot, 24px); border-radius: 50%;
@@ -377,9 +394,9 @@
     <!-- Room scanning panel (WebXR mode only) -->
     <div id="scanPanel" class="panel ui" hidden>
       <h2>Scanning your room…</h2>
-      <p id="scanText">Point your phone at the floor, tables and shelves and move it slowly around you.</p>
+      <p id="scanText">Slowly move your phone around the room</p>
       <div class="bar"><i id="scanBar"></i></div>
-      <button id="placeBtn" class="btn" disabled>Hide the marbles</button>
+      <p class="scan-count" id="scanCount"></p>
     </div>
 
     <!-- Start screen -->
@@ -475,11 +492,17 @@ const MARBLE_COUNT = 10;
 /** How long (in milliseconds) the reticle has to stay on a marble to collect it. */
 const FOCUS_TIME_MS = 3000;
 
-/** Real-world marble diameter in metres in AR (0.05 = 5 cm). Never scaled: its on-screen size comes from perspective only. */
-const MARBLE_DIAMETER_M = 0.05;
+/** Real-world marble diameter in metres in AR (0.08 = 8 cm). Never scaled: its on-screen size comes from perspective only. */
+const MARBLE_DIAMETER_M = 0.08;
 
 /** In AR, a marble can only be collected (focus or tap) from within this many metres. */
 const COLLECT_DISTANCE_M = 1.5;
+
+/** AR: the room scan lasts at least this many seconds before any marble appears. */
+const SCAN_SECONDS = 15;
+
+/** AR: marbles float at the phone's height at the end of the scan, plus or minus up to this many metres. */
+const HEIGHT_VARIATION_M = 0.3;
 
 /**
  * iPhone/iPad route into WebXR: this page's full URL (URL-encoded) is appended, and the page opens inside
@@ -503,11 +526,16 @@ const MARBLE_TYPES = [
 
 // ----- Advanced settings ------------------------------------------------
 
-/** AR: a newly placed marble drops from this height (metres) onto its surface, bounces slightly and settles. */
-const DROP_HEIGHT_M = 0.05;
-/** AR: how bouncy the marble is (0 = no bounce, 1 = bounces forever). */
-const BOUNCE_RESTITUTION = 0.4;
-const GRAVITY = 9.81;
+/** AR: marbles are placed this far (metres) from the player, spread in different directions… */
+const PLACE_DISTANCE_MIN_M = 1;
+const PLACE_DISTANCE_MAX_M = 4;
+/** …at least this far from any detected wall, furniture or other surface (and never behind one)… */
+const WALL_CLEARANCE_M = 0.3;
+/** …and at least this far from each other. */
+const MARBLE_SPACING_M = 0.8;
+/** AR: slow hover around each marble's fixed position: amplitude in metres, speed in radians per second. */
+const HOVER_AMPLITUDE_M = 0.015;
+const HOVER_SPEED = 1.3;
 /** AR: hide the parts of marbles behind real objects when the WebXR Depth API is available. */
 const USE_DEPTH_OCCLUSION = true;
 /** AR: marbles further than this (metres) are ignored when aiming (closer than this but beyond reach → "Come closer"). */
@@ -542,12 +570,16 @@ const HALO_SIZE = 5;
 const GLOW_MIN = 0.25;
 const GLOW_MAX = 0.6;
 
-/** AR scanning: surface spots are grouped into cells this big (metres) so marbles spread out. */
-const SCAN_CELL = 0.3;
-/** AR scanning: marbles are hidden automatically once this many spots per marble have been found... */
-const SCAN_SPOTS_PER_MARBLE = 2.5;
-/** ...and the player has scanned for at least this many seconds. */
-const SCAN_MIN_SECONDS = 5;
+/** AR scanning: if too little was found when the scan time ends, it is extended by this many seconds at a time. */
+const SCAN_EXTEND_SECONDS = 5;
+/** AR scanning: "enough" means at least this many surface points (any orientation)… */
+const SCAN_MIN_SURFACES = 25;
+/** …seen in at least this many of the 8 directions around the player. */
+const SCAN_MIN_DIRECTIONS = 5;
+/** AR scanning: after this many extensions the placement rules relax a little, so very open or tiny rooms still work. */
+const SCAN_RELAX_AFTER_EXTENSIONS = 4;
+/** AR scanning: surface points (walls, furniture, floor) are grouped into cells this big (metres). */
+const SURFACE_CELL = 0.15;
 /** AR scanning: ignore surfaces further than this (metres) from the player. */
 const SCAN_MAX_DISTANCE = 6;
 
@@ -610,7 +642,7 @@ const RING_LEN = 2 * Math.PI * 30; // circumference of the progress circle (r = 
 ringEl.style.strokeDasharray = RING_LEN;
 ringEl.style.strokeDashoffset = RING_LEN;
 const toastEl = $('#toast'), trackingEl = $('#tracking');
-const scanPanel = $('#scanPanel'), scanText = $('#scanText'), scanBar = $('#scanBar'), placeBtn = $('#placeBtn');
+const scanPanel = $('#scanPanel'), scanText = $('#scanText'), scanBar = $('#scanBar'), scanCount = $('#scanCount');
 const startScreen = $('#startScreen'), startBtn = $('#startBtn'), newGameBtn = $('#newGameBtn'), startMsg = $('#startMsg');
 const modeBadge = $('#modeBadge'), modeText = $('#modeText');
 const winScreen = $('#winScreen'), winTime = $('#winTime'), againBtn = $('#againBtn'), trophyEl = $('#trophy');
@@ -859,7 +891,7 @@ function uploadDepth(info) {
   occl.uDepthEnabled.value = 1;
 }
 
-/** Makes a small radial-gradient texture on a canvas (used for halo, shadow and glint). */
+/** Makes a small radial-gradient texture on a canvas (used for halo and glint). */
 function canvasTexture(draw) {
   const c = document.createElement('canvas');
   c.width = c.height = 128;
@@ -874,13 +906,6 @@ const haloTex = canvasTexture((ctx) => {
   g.addColorStop(0.22, 'rgba(255,255,255,.55)');
   g.addColorStop(0.55, 'rgba(255,255,255,.13)');
   g.addColorStop(1, 'rgba(255,255,255,0)');
-  ctx.fillStyle = g; ctx.fillRect(0, 0, 128, 128);
-});
-const shadowTex = canvasTexture((ctx) => {
-  const g = ctx.createRadialGradient(64, 64, 0, 64, 64, 64);
-  g.addColorStop(0, 'rgba(0,0,0,.9)');
-  g.addColorStop(0.45, 'rgba(0,0,0,.35)');
-  g.addColorStop(1, 'rgba(0,0,0,0)');
   ctx.fillStyle = g; ctx.fillRect(0, 0, 128, 128);
 });
 // A camera-facing highlight: bright specular spot top-left + faint rim, the cheap trick that sells "glass".
@@ -929,7 +954,6 @@ function typeResources(typeIdx, r) {
       color: t.color, emissive: t.color, emissiveIntensity: 0.55, roughness: 0.3, metalness: 0.1, flatShading: flat,
     }),
     glintMat: new THREE.SpriteMaterial({ map: glintTex, transparent: true, depthWrite: false }),
-    shadowGeo: new THREE.PlaneGeometry(r * 2.6, r * 2.6).rotateX(-Math.PI / 2),
   };
   addOcclusion(res.shellMat); addOcclusion(res.coreMat); addOcclusion(res.glintMat);
   typeCache.set(key, res);
@@ -937,10 +961,10 @@ function typeResources(typeIdx, r) {
 }
 
 /**
- * Builds one marble: root (sits on the surface) → body (bobs) → core + glass shell + glint + halo.
- * withShadow adds a soft contact shadow on the surface (AR mode).
+ * Builds one marble: root (fixed position) → body (hovers / bobs) → core + glass shell + glint + halo.
+ * ar = true for AR marbles, which float at a fixed point in the room and only hover slightly.
  */
-function createMarble(slot, typeIdx, r, withShadow) {
+function createMarble(slot, typeIdx, r, ar) {
   const res = typeResources(typeIdx, r);
   const root = new THREE.Group();
   const body = new THREE.Group();
@@ -960,26 +984,16 @@ function createMarble(slot, typeIdx, r, withShadow) {
   halo.renderOrder = 1;
   body.add(core, shell, glint, halo);
 
-  let shadow = null;
-  if (withShadow) {
-    // Soft contact shadow on the surface the marble rests on.
-    shadow = new THREE.Mesh(res.shadowGeo, addOcclusion(new THREE.MeshBasicMaterial({ map: shadowTex, transparent: true, depthWrite: false, opacity: 0.55 })));
-    shadow.position.y = 0.002;
-    root.add(shadow);
-  }
   return {
-    slot, type: typeIdx, radius: r, root, body, core, halo, glint, shadow,
-    restY: withShadow ? r : 0,       // resting height of the centre above the surface
+    slot, type: typeIdx, radius: r, root, body, core, halo, glint, ar,
+    restY: 0,
     phase: Math.random() * Math.PI * 2,
     anchor: null, collected: false,
-    // AR marbles are physical: they sit on a real surface and fall with gravity (h = height of the bottom above it).
-    physics: withShadow, h: 0, vy: 0, dropDelay: 0, settled: true,
   };
 }
 function removeMarble(m) {
   world.remove(m.root);
   m.halo.material.dispose();
-  if (m.shadow) m.shadow.material.dispose();
   if (m.anchor) { try { m.anchor.delete(); } catch (e) { /* session already gone */ } m.anchor = null; }
 }
 function clearMarbles() {
@@ -996,8 +1010,8 @@ const gridSphere = new THREE.LineSegments(
 gridSphere.visible = false;
 scene.add(gridSphere);
 
-// AR scanning visuals: dots where surfaces were found + a ring on the surface you point at.
-const MAX_SCAN_POINTS = 400;
+// AR scanning visuals: dots where surfaces (walls, furniture, floor) were found + a ring on the surface you point at.
+const MAX_SCAN_POINTS = 2500;
 const scanGeo = new THREE.BufferGeometry();
 scanGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(MAX_SCAN_POINTS * 3), 3));
 scanGeo.setDrawRange(0, 0);
@@ -1553,7 +1567,7 @@ function showGate(variant) {
     asking: ['📍', 'Allow location access',
       `Marbles only appear at ${LOCATIONS.length} spots in ${AREA_NAME}, so the game needs your location to check where you are. It is only used on your phone.`],
     ready: ['✅', S.wantAR && inZone() ? `You're at ${LOCATIONS[geo.zone].name}` : 'Location is on',
-      S.wantAR ? 'Tap Enter AR, then point your phone at the floor, tables and shelves around you.'
+      S.wantAR ? 'Tap Enter AR, then slowly move your phone around the room to scan it.'
                : 'Tap below to open the camera and look for marbles.'],
     finding: ['', 'Finding your location…', 'This can take a few seconds. Being outdoors under open sky helps.'],
     outside: ['🗺️', `You need to be at ${placeList()} in ${AREA_NAME} to find marbles.`,
@@ -1612,18 +1626,16 @@ function refreshZoneGameplay(reason = 'zone') {
   hideGate();
   clearMarbles();
   if (S.mode === 'xr' && xr.candZone !== zone) {
-    // Surfaces scanned at another place are useless here: start a fresh scan for this location.
-    xr.candidates.clear();
-    scanGeo.setDrawRange(0, 0);
-    xr.placed.clear(); xr.dropped.clear();
+    // A room map made at another place is useless here: start a fresh scan for this location.
+    resetRoomMap();
     xr.candZone = zone;
   }
   const need = remainingSlots().length;
   if (S.mode === 'camera' || need === 0) {
     spawnCameraMarbles();   // camera mode; in AR this branch only runs when nothing is left here, so it adds nothing
     enterPlaying();
-  } else if (xr.candidates.size >= need || remainingSlots().every((i) => xr.placed.has(i))) {
-    S.phase = 'placing';    // this place was scanned earlier in the session: hide the marbles right away
+  } else if (xr.scanComplete && prepareSpots()) {
+    S.phase = 'placing';    // this place was scanned earlier in the session: show the marbles right away
     hud.hidden = false; scanPanel.hidden = true; reticleEl.hidden = true;
     xr.pendingPlacement = true;
   } else {
@@ -1734,21 +1746,16 @@ function loop(timeMs, frame) {
 
 const _g = new THREE.Vector3();
 /**
- * AR marbles behave like objects: they fall onto their surface, bounce, settle and then stay still
- * (nothing is scaled or moved after that). "Play without AR" marbles bob and spin to be easier to spot.
- * The glow pulses in both modes.
+ * AR marbles stay at their fixed point in the room and only hover a couple of centimetres up and down
+ * (never scaled). "Play without AR" marbles bob and spin to be easier to spot. The glow pulses in both modes.
  */
 function animateMarbles(t, dt) {
   for (const m of S.marbles) {
     const focused = S.focus.marble === m;
     const pulse = Math.sin(t * 2.6 + m.phase * 1.3) * 0.5 + 0.5;
     m.halo.material.opacity = GLOW_MIN + (GLOW_MAX - GLOW_MIN) * pulse + (focused ? 0.3 : 0);
-    if (m.physics) {
-      stepDrop(m, dt);
-      m.body.position.y = m.radius + m.h;     // resting on the surface once h reaches 0
-      const k = clamp(m.h / 0.08, 0, 1);      // the shadow fades and spreads while the marble is in the air
-      m.shadow.material.opacity = 0.55 * (1 - 0.6 * k);
-      m.shadow.scale.setScalar(1 + 0.6 * k);
+    if (m.ar) {
+      m.body.position.y = HOVER_AMPLITUDE_M * Math.sin(t * HOVER_SPEED + m.phase); // slow hover; root never moves
     } else {
       const s = Math.sin(t * BOB_SPEED + m.phase) * 0.5 + 0.5;
       m.body.position.y = m.restY + s * m.radius * BOB_HEIGHT;
@@ -1761,21 +1768,6 @@ function animateMarbles(t, dt) {
     _g.copy(camera.position).sub(marbleWorldPos(m, _w));
     const len = _g.length();
     if (len > 1e-4) m.glint.position.copy(_g.multiplyScalar((m.radius * 0.9) / len));
-  }
-}
-/** Gravity + bounce for a freshly placed AR marble (small sub-steps keep the bounce stable). */
-function stepDrop(m, dt) {
-  if (m.settled) return;
-  if (m.dropDelay > 0) { m.dropDelay -= dt; return; }
-  const n = 4, h = dt / n;
-  for (let i = 0; i < n && !m.settled; i++) {
-    m.vy -= GRAVITY * h;
-    m.h += m.vy * h;
-    if (m.h <= 0) {
-      m.h = 0;
-      if (Math.abs(m.vy) < 0.25) { m.vy = 0; m.settled = true; }
-      else m.vy = -m.vy * BOUNCE_RESTITUTION;
-    }
   }
 }
 
@@ -1816,7 +1808,7 @@ function playAgain() {
   buildSlots();
   winScreen.hidden = true;
   clearMarbles();
-  xr.placed.clear(); xr.dropped.clear();      // new marbles get new spots (scanned surfaces are kept)
+  xr.placed.clear();      // new marbles get new spots (the room map is kept)
   if (S.mode && (S.mode === 'camera' || xr.session)) {
     S.phase = 'playing';  // leave the 'won' state so the refresh below runs
     refreshZoneGameplay('again');
@@ -1828,20 +1820,28 @@ function playAgain() {
 // =====================================================================
 //  MODE 1: WebXR immersive AR (Android Chrome with ARCore, etc.)
 // =====================================================================
+// Free-space map seen from above: 10 cm cells over ±12 m. 0 = unknown, 1 = seen free, 2 = occupied (wall or
+// furniture at about marble height). Scan rays mark the cells they cross as free; walls block rays, so the space
+// behind them stays unknown.
+const GRID_CELL = 0.1, GRID_HALF = 120, GRID_N = GRID_HALF * 2;
 const xr = {
   session: null, refSpace: null, viewerSpace: null, hitSources: [], hasOverlay: false,
-  candidates: new Map(),        // surface spots found while scanning (key = grid cell)
   candZone: undefined,          // which location the scanned spots belong to
   placed: new Map(),            // slot index → spot, so a marble keeps its spot when you leave and come back
-  dropped: new Set(),           // slots whose marble already did its spawn drop this session
+  surfaces: new Map(),          // room map: surface points of any orientation (walls, furniture, floor), key = cell
+  sectors: new Set(),           // which of the 8 directions around the player have surfaces in the map
+  planes: new Map(),            // detected planes (XRPlane → { inv, poly, up }) for wall checks
+  grid: new Uint8Array(GRID_N * GRID_N), freeCells: 0, // free-space map (see GRID_CELL)
+  scanDuration: 0, scanExtensions: 0, scanComplete: false, scanHeight: null,
   features: null,               // Set of enabled optional features (null if the browser doesn't say)
   anchors: false, depth: false, depthFormat: '', lightProbe: null,
   endToGate: null,              // no DOM overlay: leave AR to show this gate screen in the page
   viewer: new THREE.Vector3(),
   frameCount: 0, scanStart: 0, pendingPlacement: false, lostSince: 0,
 };
-// Several hit-test rays fan out from the screen (biased downwards) so scanning finds surfaces faster.
-const HIT_RAYS = [[0, 0], [0.2, 0.08], [-0.2, 0.08], [0.2, -0.25], [-0.2, -0.25], [0, -0.45]];
+// Several hit-test rays fan out from the screen so scanning maps the room faster.
+// They point in all directions from the screen (left/right/up/down) so walls and furniture are found, not only the floor.
+const HIT_RAYS = [[0, 0], [0.3, 0], [-0.3, 0], [0, 0.3], [0, -0.3], [0.3, 0.3], [-0.3, 0.3], [0.3, -0.35], [-0.3, -0.35], [0, -0.55]];
 
 /** Was an optional WebXR feature granted? (If the browser doesn't report it, the API checks at each use decide.) */
 const xrHas = (f) => (xr.features ? xr.features.has(f) : true);
@@ -1924,14 +1924,12 @@ async function startXR() {
   D.set('AR extras', `anchors ${xr.anchors ? 'yes' : 'no'}, depth ${xr.depth ? 'yes' : 'no'}, light ${xr.lightProbe ? 'yes' : 'no'}, hit-test sources ${xr.hitSources.length}`);
 
   clearMarbles();
-  xr.candidates.clear();
-  scanGeo.setDrawRange(0, 0);
-  xr.placed.clear(); xr.dropped.clear();
+  resetRoomMap();
   xr.candZone = undefined;
   xr.frameCount = 0;
   startGameLoop();
   const extras = [xr.anchors && 'anchors', xr.depth && 'occlusion', xr.lightProbe && 'room lighting'].filter(Boolean);
-  toast('Full AR: marbles stay put on your real floor and furniture.' + (extras.length ? ` Using ${extras.join(', ')}.` : ''), 3500);
+  toast('Full AR: marbles float at fixed spots in your room.' + (extras.length ? ` Using ${extras.join(', ')}.` : ''), 3500);
   refreshZoneGameplay('start'); // scan and hide marbles if at a marble spot, otherwise show the location screen
 }
 
@@ -1940,20 +1938,33 @@ overlayEl.addEventListener('beforexrselect', (e) => {
   if (e.target.closest && e.target.closest('button, a, #hud, .panel, .screen, #debugPanel')) e.preventDefault();
 });
 
+/** Starts the room scan (at least SCAN_SECONDS). Marbles appear only once it is complete. */
 function beginScanning() {
   S.phase = 'scanning';
   xr.scanStart = performance.now();
+  xr.scanDuration = SCAN_SECONDS;
+  xr.scanExtensions = 0;
   scanPoints.visible = true;
   hud.hidden = false;
   reticleEl.hidden = true;
   reticle3D.visible = false;
   scanPanel.hidden = false;
-  placeBtn.disabled = true;
+  scanText.textContent = 'Slowly move your phone around the room';
+  scanBar.style.width = '0%';
+  scanCount.textContent = '';
 }
 
-placeBtn.addEventListener('click', () => {
-  if (S.phase === 'scanning' && xr.candidates.size >= remainingSlots().length) xr.pendingPlacement = true;
-});
+/** Forgets the room map (new place or new AR session). */
+function resetRoomMap() {
+  xr.surfaces.clear();
+  xr.grid.fill(0); xr.freeCells = 0;
+  xr.sectors.clear();
+  xr.planes.clear();
+  scanGeo.setDrawRange(0, 0);
+  xr.placed.clear();
+  xr.scanComplete = false;
+  xr.scanHeight = null;
+}
 
 /** Uncollected marbles that belong to the player's current location. */
 const remainingSlots = () => S.round.slots.map((s, i) => (!s.collected && slotActive(s) ? i : -1)).filter((i) => i >= 0);
@@ -2005,18 +2016,35 @@ function xrFrame(frame) {
   }
 }
 
-/** Adds a surface spot if it is upward-facing, visible from above, and in a new grid cell. */
-function addSpot(x, y, z) {
-  if (y > xr.viewer.y - 0.1) return;                 // top surface must be below eye level to be visible
-  const dx = x - xr.viewer.x, dz = z - xr.viewer.z;
-  if (dx * dx + dz * dz > SCAN_MAX_DISTANCE * SCAN_MAX_DISTANCE) return;
-  if (xr.candidates.size >= MAX_SCAN_POINTS) return;
-  const key = `${Math.round(x / SCAN_CELL)}|${Math.round(y / 0.25)}|${Math.round(z / SCAN_CELL)}`;
-  if (xr.candidates.has(key)) return;
-  const i = xr.candidates.size;
-  xr.candidates.set(key, new THREE.Vector3(x, y, z));
+/** Index of the free-space map cell under world point (x, z), or -1 outside the map. */
+function gridIndex(x, z) {
+  const i = Math.floor(x / GRID_CELL) + GRID_HALF, j = Math.floor(z / GRID_CELL) + GRID_HALF;
+  return i < 0 || j < 0 || i >= GRID_N || j >= GRID_N ? -1 : j * GRID_N + i;
+}
+/** A scan ray from the eye o to a hit: the cells it crossed are free; a hit at about marble height is occupied. */
+function markRay(o, hx, hy, hz) {
+  const dx = hx - o.x, dz = hz - o.z, L = Math.hypot(dx, dz), g = xr.grid;
+  for (let t = 0; t < L - 0.15; t += 0.05) {
+    const k = gridIndex(o.x + (dx * t) / L, o.z + (dz * t) / L);
+    if (k >= 0 && g[k] === 0) { g[k] = 1; xr.freeCells++; }
+  }
+  if (Math.abs(hy - o.y) < 0.65) { const k = gridIndex(hx, hz); if (k >= 0) { if (g[k] === 1) xr.freeCells--; g[k] = 2; } }
+}
+
+/** Adds a surface point of any orientation (wall, furniture, floor…) to the room map, and shows it as a dot. */
+function addSurface(x, y, z) {
+  const dx = x - xr.viewer.x, dz = z - xr.viewer.z, d2 = dx * dx + dz * dz;
+  if (d2 > SCAN_MAX_DISTANCE * SCAN_MAX_DISTANCE || xr.surfaces.size >= MAX_SCAN_POINTS) return;
+  const key = `${Math.round(x / SURFACE_CELL)}|${Math.round(y / SURFACE_CELL)}|${Math.round(z / SURFACE_CELL)}`;
+  if (xr.surfaces.has(key)) return;
+  const i = xr.surfaces.size;
+  xr.surfaces.set(key, new THREE.Vector3(x, y, z));
+  if (d2 > 0.25) { // which of the 8 directions around the player this point is in
+    const yaw = (Math.atan2(-dx, -dz) + Math.PI * 2) % (Math.PI * 2);
+    xr.sectors.add(Math.floor(yaw / (Math.PI / 4)) % 8);
+  }
   const attr = scanGeo.getAttribute('position');
-  attr.setXYZ(i, x, y + 0.003, z);
+  attr.setXYZ(i, x, y, z);
   attr.needsUpdate = true;
   scanGeo.setDrawRange(0, i + 1);
 }
@@ -2030,31 +2058,41 @@ function collectHitSpots(frame, scanning) {
     if (!hp) return;
     const m = hp.transform.matrix;           // column-major; the pose's Y axis is the surface normal
     if (i === 0 && scanning) { surfaceRing.matrix.fromArray(m); surfaceRing.matrixWorldNeedsUpdate = true; centreHit = true; }
-    if (m[5] > 0.8) addSpot(m[12], m[13], m[14]); // only horizontal, upward-facing surfaces
+    addSurface(m[12], m[13], m[14]);              // every surface counts for the room map (walls too)
+    markRay(xr.viewer, m[12], m[13], m[14]);      // the space up to this hit is free
   });
   surfaceRing.visible = scanning && centreHit;
 }
 
-/** Plane detection (if available) adds random spots across each detected floor / table / shelf. */
+/**
+ * Plane detection (if available): every detected plane, horizontal or vertical (walls), is kept for the
+ * placement checks and sampled into the room map.
+ */
 function collectPlaneSpots(frame) {
   if (!xrHas('plane-detection')) return;
   let planes;
   try { planes = frame.detectedPlanes; } catch (e) { return; }
   if (!planes) return;
   planes.forEach((plane) => {
-    if (plane.orientation && plane.orientation !== 'horizontal') return;
     const pp = frame.getPose(plane.planeSpace, xr.refSpace);
     const poly = plane.polygon;
     if (!pp || !poly || poly.length < 3) return;
     const m = pp.transform.matrix;
-    if (m[5] < 0.8) return; // skip ceilings
+    const up = m[5] > 0.8;
+    let snap = xr.planes.get(plane);
+    if (!snap) { snap = { inv: new THREE.Matrix4() }; xr.planes.set(plane, snap); }
+    snap.inv.fromArray(m).invert();
+    snap.poly = Array.from(poly, (v) => ({ x: v.x, z: v.z }));
+    snap.up = up;
     let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
     for (const v of poly) { minX = Math.min(minX, v.x); maxX = Math.max(maxX, v.x); minZ = Math.min(minZ, v.z); maxZ = Math.max(maxZ, v.z); }
-    for (let k = 0; k < 4; k++) {
+    for (let k = 0; k < 6; k++) {
       for (let tries = 0; tries < 8; tries++) {
         const x = rand(minX, maxX), z = rand(minZ, maxZ);
         if (!pointInPolygon(x, z, poly)) continue;
-        addSpot(m[0] * x + m[8] * z + m[12], m[1] * x + m[9] * z + m[13], m[2] * x + m[10] * z + m[14]);
+        const wx = m[0] * x + m[8] * z + m[12], wy = m[1] * x + m[9] * z + m[13], wz = m[2] * x + m[10] * z + m[14];
+        addSurface(wx, wy, wz);
+        markRay(xr.viewer, wx, wy, wz);
         break;
       }
     }
@@ -2069,63 +2107,147 @@ function pointInPolygon(x, z, poly) {
   return inside;
 }
 
+/** Scan progress; when the time is up, place the marbles if the room map is good enough, otherwise extend. */
 function updateScanUI() {
-  const need = remainingSlots().length;
-  const target = Math.max(6, Math.ceil(need * SCAN_SPOTS_PER_MARBLE));
-  const found = xr.candidates.size;
-  scanBar.style.width = Math.min(100, (found / target) * 100) + '%';
-  placeBtn.disabled = found < need;
-  scanText.textContent = found < need
-    ? `Point at the floor, tables and shelves and move slowly around you. (${found} spots found)`
-    : `Good! Keep scanning for better hiding spots, or hide the marbles now. (${found} spots)`;
-  if (found >= target && performance.now() - xr.scanStart > SCAN_MIN_SECONDS * 1000) xr.pendingPlacement = true;
+  const elapsed = (performance.now() - xr.scanStart) / 1000;
+  scanBar.style.width = Math.min(100, (elapsed / xr.scanDuration) * 100) + '%';
+  scanCount.textContent = `${xr.surfaces.size} surface points · ${xr.sectors.size} / 8 directions`;
+  if (D.on) D.set('scan', `${elapsed.toFixed(0)} / ${xr.scanDuration} s, ${xr.surfaces.size} surfaces, ${xr.sectors.size}/8 directions, ${(xr.freeCells * GRID_CELL * GRID_CELL).toFixed(1)} m² seen free, ${xr.planes.size} planes`);
+  if (elapsed < xr.scanDuration) return;
+
+  const relaxed = xr.scanExtensions >= SCAN_RELAX_AFTER_EXTENSIONS;
+  const enough = xr.surfaces.size >= SCAN_MIN_SURFACES && xr.sectors.size >= SCAN_MIN_DIRECTIONS;
+  xr.scanHeight = xr.viewer.y; // marbles float around the phone's height at the end of the scan
+  if ((enough || relaxed) && prepareSpots(relaxed)) {
+    xr.scanComplete = true;
+    xr.pendingPlacement = true;
+    D.log(`scan complete after ${elapsed.toFixed(0)} s${relaxed ? ' (relaxed rules)' : ''}`);
+    return;
+  }
+  xr.scanDuration += SCAN_EXTEND_SECONDS;
+  xr.scanExtensions++;
+  scanText.textContent = 'Keep scanning, point at walls and furniture';
+  D.log(`scan extended to ${xr.scanDuration} s (${enough ? 'no valid spots yet' : 'too few surfaces'})`);
 }
 
+// ---------- Choosing floating marble spots from the room map ----------
+const _sd = new THREE.Vector3(), _st = new THREE.Vector3(), _lp = new THREE.Vector3(), _le = new THREE.Vector3();
+/** Squared distance from point p to the segment a–b. */
+function segDist2(a, b, p) {
+  _sd.subVectors(b, a);
+  const len2 = _sd.lengthSq();
+  const t = len2 ? clamp(_st.subVectors(p, a).dot(_sd) / len2, 0, 1) : 0;
+  return _st.copy(a).addScaledVector(_sd, t).distanceToSquared(p);
+}
+/** Distance in a plane's own x/z coordinates from a point to the plane polygon's outline. */
+function distToPolygon(x, z, poly) {
+  let best = Infinity;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const a = poly[j], b = poly[i], ex = b.x - a.x, ez = b.z - a.z, l2 = ex * ex + ez * ez;
+    const t = l2 ? clamp(((x - a.x) * ex + (z - a.z) * ez) / l2, 0, 1) : 0;
+    best = Math.min(best, Math.hypot(a.x + ex * t - x, a.z + ez * t - z));
+  }
+  return best;
+}
+/** Is P too close to this detected plane, or is the plane between the player's eye and P? */
+function planeBlocks(pl, eye, P) {
+  _lp.copy(P).applyMatrix4(pl.inv);
+  _le.copy(eye).applyMatrix4(pl.inv);
+  if (Math.abs(_lp.y) < WALL_CLEARANCE_M &&
+      (pointInPolygon(_lp.x, _lp.z, pl.poly) || distToPolygon(_lp.x, _lp.z, pl.poly) < WALL_CLEARANCE_M)) return true;
+  if (_lp.y * _le.y < 0) { // the line of sight crosses the plane: is the crossing point on the plane?
+    const t = _le.y / (_le.y - _lp.y);
+    if (pointInPolygon(_le.x + (_lp.x - _le.x) * t, _le.z + (_lp.z - _le.z) * t, pl.poly)) return true;
+  }
+  return false;
+}
 /**
- * Picks n spots that are as far from each other as possible ("farthest point sampling"),
- * also keeping away from spots already in use (existing).
+ * Line of sight from a to b in the free-space map: no occupied cell on it and, if needSeen, every cell on it was
+ * seen free during the scan. This keeps marbles inside the room and never behind a wall, even one the scan
+ * did not map (walls block scan rays, so the space behind them is never marked free).
  */
-function spreadPick(points, n, existing = []) {
-  const pool = shuffle(points.slice());
+function gridPathClear(a, b, needSeen) {
+  const dx = b.x - a.x, dz = b.z - a.z, L = Math.hypot(dx, dz);
+  for (let t = 0; t <= L; t += 0.05) {
+    const k = gridIndex(a.x + (dx * t) / (L || 1), a.z + (dz * t) / (L || 1));
+    const v = k < 0 ? 0 : xr.grid[k];
+    if (v === 2 || (needSeen && v !== 1)) return false;
+  }
+  return true;
+}
+/**
+ * Clearance around P in the free-space map: no occupied cell within r metres and, if needSeen, every cell within
+ * r was seen free. The second part also keeps marbles away from objects the AR system never reported (the scan
+ * simply could not see past them, so their footprint is not free).
+ */
+function gridClearAround(P, r, needSeen) {
+  const n = Math.ceil(r / GRID_CELL) + 1, ci = Math.floor(P.x / GRID_CELL), cj = Math.floor(P.z / GRID_CELL), r2 = (r + GRID_CELL / 2) ** 2;
+  for (let j = cj - n; j <= cj + n; j++) for (let i = ci - n; i <= ci + n; i++) {
+    const cx = (i + 0.5) * GRID_CELL, cz = (j + 0.5) * GRID_CELL;
+    if ((cx - P.x) ** 2 + (cz - P.z) ** 2 > r2) continue;
+    const k = gridIndex(cx, cz), v = k < 0 ? 0 : xr.grid[k];
+    if (v === 2 || (needSeen && v !== 1)) return false;
+  }
+  return true;
+}
+/** All placement rules for one floating spot P, seen from the player's eye. */
+function spotIsValid(P, eye, others, relaxed) {
+  const spacing = relaxed ? 0.5 : MARBLE_SPACING_M;
+  for (const o of others) if (o.distanceToSquared(P) < spacing * spacing) return false;
+  if (!gridPathClear(eye, P, !relaxed)) return false;    // seen-free line of sight: inside the room, not behind a wall
+  if (!gridClearAround(P, WALL_CLEARANCE_M, !relaxed)) return false; // 0.3 m of seen-free space all around
+  // Surfaces are stored as points SURFACE_CELL apart, so the real surface can lie up to one cell beyond the
+  // nearest point: checking against WALL_CLEARANCE_M + SURFACE_CELL keeps the true gap at least WALL_CLEARANCE_M.
+  const clear = WALL_CLEARANCE_M + SURFACE_CELL, clear2 = clear * clear, sight2 = 0.2 * 0.2;
+  for (const q of xr.surfaces.values()) {
+    if (q.distanceToSquared(P) < clear2) return false;  // too close to a wall / furniture
+    if (segDist2(eye, P, q) < sight2) return false;     // a surface between player and spot: it would be behind a wall
+  }
+  for (const pl of xr.planes.values()) if (planeBlocks(pl, eye, P)) return false;
+  return true;
+}
+/**
+ * Picks n floating spots around the player: different directions, PLACE_DISTANCE_MIN_M–MAX_M away, at the
+ * scan-end phone height ± HEIGHT_VARIATION_M, clear of walls and furniture. Returns null if not possible yet.
+ */
+function pickAirSpots(n, kept, relaxed) {
+  const eye = xr.viewer.clone();
+  const h0 = xr.scanHeight != null ? xr.scanHeight : eye.y;
+  const minDist = relaxed ? 0.7 : PLACE_DISTANCE_MIN_M;
+  const sector = (Math.PI * 2) / Math.max(n, 1), base = Math.random() * Math.PI * 2;
   const chosen = [];
-  if (n <= 0 || !pool.length) return chosen;
-  const d2 = (a, b) => (a.x - b.x) ** 2 + (a.z - b.z) ** 2 + ((a.y - b.y) * 2) ** 2;
-  const minD = pool.map((p) => existing.reduce((m, e) => Math.min(m, d2(p, e)), Infinity));
-  const take = (i) => {
-    const p = pool[i];
-    pool.splice(i, 1); minD.splice(i, 1);
-    chosen.push(p);
-    for (let j = 0; j < pool.length; j++) minD[j] = Math.min(minD[j], d2(pool[j], p));
-  };
-  if (!existing.length) take(pool.length - 1); // random start
-  while (chosen.length < n && pool.length) {
-    let best = 0;
-    for (let i = 1; i < pool.length; i++) if (minD[i] > minD[best]) best = i;
-    take(best);
+  for (let i = 0; i < n; i++) {
+    let spot = null;
+    for (let a = 0; a < 140 && !spot; a++) {
+      // first try this marble's own direction (so the marbles surround the player), then any direction
+      const yaw = a < 60 ? base + (i + Math.random()) * sector : Math.random() * Math.PI * 2;
+      const d = rand(minDist, PLACE_DISTANCE_MAX_M);
+      const P = new THREE.Vector3(eye.x - Math.sin(yaw) * d, h0 + rand(-HEIGHT_VARIATION_M, HEIGHT_VARIATION_M), eye.z - Math.cos(yaw) * d);
+      if (spotIsValid(P, eye, kept.concat(chosen), relaxed)) spot = P;
+    }
+    if (!spot) return null;
+    chosen.push(spot);
   }
   return chosen;
+}
+/** Gives every remaining marble at this location a spot (marbles placed earlier this session keep theirs). */
+function prepareSpots(relaxed = false) {
+  const missing = remainingSlots().filter((i) => !xr.placed.has(i));
+  if (!missing.length) return true;
+  const spots = pickAirSpots(missing.length, [...xr.placed.values()], relaxed);
+  if (!spots) return false;
+  missing.forEach((slot, k) => xr.placed.set(slot, spots[k]));
+  return true;
 }
 
 function placeMarblesXR(frame) {
   clearMarbles();
-  const slots = remainingSlots();
-  // Marbles placed earlier at this location keep their spot; the others get new, well-spread spots.
-  const missing = slots.filter((i) => !xr.placed.has(i));
-  const kept = slots.filter((i) => xr.placed.has(i)).map((i) => xr.placed.get(i));
-  const fresh = spreadPick([...xr.candidates.values()], missing.length, kept);
-  missing.forEach((slotIdx, k) => {
-    const base = fresh.length ? fresh[k % fresh.length].clone() : xr.viewer.clone().setY(xr.viewer.y - 1.4);
-    if (k >= fresh.length) base.x += rand(-0.15, 0.15); // only if there were too few spots
-    xr.placed.set(slotIdx, base);
-  });
+  // prepareSpots() has given each remaining marble a floating spot; marbles keep it for the whole session.
+  const slots = remainingSlots().filter((i) => xr.placed.has(i));
   slots.forEach((slotIdx) => {
     const base = xr.placed.get(slotIdx).clone();
     const m = createMarble(slotIdx, S.round.slots[slotIdx].type, MARBLE_DIAMETER_M / 2, true);
-    m.root.position.copy(base);  // the surface point from hit-testing; fixed in world space
-    if (!xr.dropped.has(slotIdx)) { // first appearance this session: drop onto the surface
-      m.h = DROP_HEIGHT_M; m.settled = false; m.dropDelay = rand(0, 0.35);
-      xr.dropped.add(slotIdx);
-    }
+    m.root.position.copy(base);  // fixed point in the room, floating at about phone height
     world.add(m.root);
     S.marbles.push(m);
     // Anchor each marble to the real world when the device supports anchors; otherwise it simply stays
@@ -2365,9 +2487,11 @@ restartBtn.addEventListener('click', () => {
     if (['playing', 'scanning', 'placing', 'away'].includes(S.phase)) playAgain();
     return;
   }
+  // The button keeps its size (so it never grows over the score bar); a toast explains the second tap.
   restartBtn.classList.add('armed');
-  restartBtn.textContent = 'Restart?';
-  restartTimer = setTimeout(() => { restartBtn.classList.remove('armed'); restartBtn.textContent = '↻'; }, 2500);
+  clearToasts();
+  toast('Tap ↻ again to restart the round', 2300);
+  restartTimer = setTimeout(() => { restartBtn.classList.remove('armed'); }, 2500);
 });
 
 function onResize() {
@@ -2403,8 +2527,8 @@ async function detectSupport() {
   modeBadge.className = 'badge';
   if (!support.webgl) { modeBadge.classList.add('bad'); modeText.textContent = '3D graphics (WebGL) unavailable'; }
   else if (!support.secure) { modeBadge.classList.add('bad'); modeText.textContent = 'Needs HTTPS to use the camera'; }
-  else if (support.xr && isIOS) { modeBadge.classList.add('xr'); modeText.textContent = 'Full AR (App Clip): marbles stay put on your real surfaces'; }
-  else if (support.xr) { modeBadge.classList.add('xr'); modeText.textContent = 'Full AR: marbles stay put on your real surfaces'; }
+  else if (support.xr && isIOS) { modeBadge.classList.add('xr'); modeText.textContent = 'Full AR (App Clip): marbles float at fixed spots in your room'; }
+  else if (support.xr) { modeBadge.classList.add('xr'); modeText.textContent = 'Full AR: marbles float at fixed spots in your room'; }
   else if (isIOS) { modeBadge.classList.add('cam'); modeText.textContent = 'On iPhone, AR opens in the Needle Go App Clip'; }
   else { modeBadge.classList.add('bad'); modeText.textContent = 'Full AR is not available in this browser'; }
 
