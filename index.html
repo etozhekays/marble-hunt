@@ -159,13 +159,37 @@
   #reticle.locked .track { stroke: rgba(124,240,255,.6); }
 
   /* ---------- Toast / banners / panels ---------- */
+  /* Stack under the score bar: location label, GPS hint, toasts. --hud-bottom is set from JS. */
+  #subHud {
+    position: absolute; left: 0; right: 0; top: calc(var(--hud-bottom, var(--safe-top)) + 8px);
+    display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 0 16px; pointer-events: none;
+  }
+  .pill {
+    max-width: 100%; padding: 5px 12px; border-radius: 999px; font-size: 13px; font-weight: 600; text-align: center;
+    background: var(--panel); border: 1px solid rgba(255,255,255,.12); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+  }
+  .pill.warn { background: rgba(255, 185, 60, .94); color: #1d1400; border-color: transparent; }
   .toast {
-    position: absolute; left: 50%; top: calc(var(--safe-top) + 92px); transform: translate(-50%, -8px);
-    max-width: calc(100% - 32px); width: max-content; padding: 10px 16px; border-radius: 14px;
+    max-width: 100%; width: max-content; padding: 10px 16px; border-radius: 14px; transform: translateY(-8px);
     background: var(--panel); border: 1px solid rgba(255,255,255,.1); font-size: 14px; line-height: 1.35; text-align: center;
     opacity: 0; transition: opacity .25s, transform .25s; backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
   }
-  .toast.show { opacity: 1; transform: translate(-50%, 0); }
+  .toast.show { opacity: 1; transform: none; }
+
+  /* ---------- Location gate (outside a zone, waiting for GPS, permission problems) ---------- */
+  #gateScreen { padding-top: calc(var(--hud-bottom, var(--safe-top)) + 24px); }
+  .gate-icon { font-size: 52px; line-height: 1; }
+  .gate-icon.spinner {
+    width: 52px; height: 52px; font-size: 0; border-radius: 50%;
+    border: 5px solid rgba(255,255,255,.15); border-top-color: var(--accent); animation: spin 1s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg) } }
+  .gate-title { margin: 0; font-size: 22px; line-height: 1.3; max-width: 340px; }
+  .distance { font-size: 17px; font-weight: 700; color: var(--accent); max-width: 330px; line-height: 1.35; }
+  a.btn { display: inline-flex; align-items: center; justify-content: center; text-decoration: none; }
+  .loc-note { margin: 0; max-width: 320px; font-size: 14px; line-height: 1.4; color: var(--muted); }
+  .slot.loc-start { margin-left: 8px; }   /* small gap between the locations' groups of slots */
+  .slot.other { opacity: .35; }           /* marbles that belong to the other location */
   .banner {
     position: absolute; left: 16px; right: 16px; bottom: calc(var(--safe-bottom) + 24px); padding: 12px 14px; border-radius: 14px;
     background: rgba(255, 107, 125, .9); color: #fff; font-weight: 600; font-size: 14px; text-align: center;
@@ -220,6 +244,19 @@
   <!-- Everything in #overlay stays visible inside a WebXR session (it is the DOM-overlay root). -->
   <div id="overlay">
 
+    <!-- Location gate: shown instead of marbles when the player is not at a marble location. -->
+    <section id="gateScreen" class="screen ui" hidden>
+      <div class="gate-icon" id="gateIcon">📍</div>
+      <h2 class="gate-title" id="gateTitle"></h2>
+      <p class="lead" id="gateText"></p>
+      <div class="distance" id="gateDistance" hidden></div>
+      <div class="stack">
+        <a id="gateMaps" class="btn" target="_blank" rel="noopener" hidden>Open in Maps</a>
+        <button id="gatePrimary" class="btn" hidden></button>
+        <button id="gateBack" class="btn-ghost">Back</button>
+      </div>
+    </section>
+
     <!-- Score bar -->
     <header id="hud" class="ui" hidden>
       <div class="hud-row">
@@ -234,7 +271,11 @@
       <div id="slots" class="slots"></div>
     </header>
 
-    <div id="toast" class="toast" role="status"></div>
+    <div id="subHud">
+      <div id="zoneLabel" class="pill" hidden></div>
+      <div id="gpsHint" class="pill warn" role="status" hidden></div>
+      <div id="toast" class="toast" role="status"></div>
+    </div>
     <div id="tracking" class="banner" hidden>Tracking lost. Move slowly and point at well-lit surfaces.</div>
 
     <!-- Centre reticle. The .prog circle fills up during the focus time. -->
@@ -263,6 +304,7 @@
       <div class="hero" id="hero"></div>
       <h1 class="title">Marble Hunt<small>AR</small></h1>
       <p class="lead" id="leadText">Find the glass marbles hidden around your room. Hold the ring on one for 3 seconds, or tap it.</p>
+      <p class="loc-note" id="locNote"></p>
       <div class="badge" id="modeBadge"><span class="dot"></span><span id="modeText">Checking your device…</span></div>
       <div class="stack">
         <button id="startBtn" class="btn" disabled>Start</button>
@@ -302,10 +344,42 @@ import * as THREE from 'three';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 
 // =====================================================================
+//  LOCATION SETTINGS: where marbles can be found
+// =====================================================================
+
+/**
+ * Marble locations. Marbles only appear when the player is within RADIUS_METERS of one of these.
+ * The total number of marbles (MARBLE_COUNT) is split evenly between them. Add or remove entries freely.
+ *   name:    shown to players (score-bar label, "you need to be at…" message)
+ *   address: full address for reference (also used as the pin label in Apple Maps)
+ *   lat/lng: coordinates in decimal degrees
+ * Note: Furmanov Street was renamed Nazarbayev Avenue, so the first place uses its current name for players.
+ */
+const LOCATIONS = [
+  { name: 'Nazarbayev Ave. 240', address: 'Furmanov Ave 240, Almaty, Kazakhstan',      lat: 43.229879, lng: 76.950460 },
+  { name: 'Zhamakayev St. 2/1',  address: 'Zhamakayev St. 2/1, Almaty, Kazakhstan',    lat: 43.223034, lng: 76.938764 },
+];
+
+/** How close (metres) the player must be to a location for its marbles to appear. */
+const RADIUS_METERS = 20;
+
+/** City / area name used in the "you need to be at…" message. */
+const AREA_NAME = 'Almaty';
+
+/** GPS is noisy: the player only counts as having left a zone after this many readings in a row outside it. */
+const EXIT_CONFIRM_READINGS = 3;
+
+/** If GPS accuracy is worse than this (metres), show a hint to move to open sky. */
+const ACCURACY_WARN_METERS = 30;
+
+/** Set to true to skip the location check (all marbles appear wherever you are), for testing at home. */
+const DEBUG_SKIP_LOCATION = false;
+
+// =====================================================================
 //  GAME SETTINGS: change these to tune the game
 // =====================================================================
 
-/** Number of marbles hidden in each round. */
+/** Total number of marbles in each round (shared between all LOCATIONS). */
 const MARBLE_COUNT = 10;
 
 /** How long (in milliseconds) the reticle has to stay on a marble to collect it. */
@@ -428,9 +502,17 @@ const startScreen = $('#startScreen'), startBtn = $('#startBtn'), newGameBtn = $
 const modeBadge = $('#modeBadge'), modeText = $('#modeText');
 const winScreen = $('#winScreen'), winTime = $('#winTime'), againBtn = $('#againBtn'), trophyEl = $('#trophy');
 const errorScreen = $('#errorScreen');
+const gateScreen = $('#gateScreen'), gateIcon = $('#gateIcon'), gateTitle = $('#gateTitle'), gateText = $('#gateText');
+const gateDistance = $('#gateDistance'), gateMaps = $('#gateMaps'), gatePrimary = $('#gatePrimary'), gateBack = $('#gateBack');
+const zoneLabel = $('#zoneLabel'), gpsHint = $('#gpsHint');
 
-$('#leadText').textContent =
-  `Find the ${MARBLE_COUNT} glass marbles hidden around your room. Hold the ring on one for ${FOCUS_TIME_MS / 1000} seconds, or tap it.`;
+$('#leadText').textContent = DEBUG_SKIP_LOCATION
+  ? `Find the ${MARBLE_COUNT} glass marbles hidden around you. Hold the ring on one for ${FOCUS_TIME_MS / 1000} seconds, or tap it.`
+  : `Find the ${MARBLE_COUNT} glass marbles hidden at ${LOCATIONS.length} spots in ${AREA_NAME}. Hold the ring on one for ${FOCUS_TIME_MS / 1000} seconds, or tap it.`;
+// One-line explanation of the location request, visible before the browser's permission prompt appears.
+$('#locNote').textContent = DEBUG_SKIP_LOCATION
+  ? '🛠 Debug mode: the location check is switched off.'
+  : `📍 Your location is used only to check that you're at one of the marble spots.`;
 
 // Decorative marbles on the start screen
 MARBLE_TYPES.forEach((t, i) => {
@@ -464,30 +546,35 @@ const support = { ready: false, xr: false, camera: false, secure: true, webgl: t
 function loadRound() {
   try {
     const r = JSON.parse(localStorage.getItem(STORAGE_KEY));
-    if (!r || r.v !== 1 || r.total !== MARBLE_COUNT || !Array.isArray(r.slots) || r.slots.length !== MARBLE_COUNT) return null;
-    if (r.slots.some((s) => !(s.type >= 0 && s.type < MARBLE_TYPES.length))) return null;
+    if (!r || r.v !== 2 || r.total !== MARBLE_COUNT || r.locCount !== LOCATIONS.length) return null;
+    if (!Array.isArray(r.slots) || r.slots.length !== MARBLE_COUNT) return null;
+    if (r.slots.some((s) => !(s.type >= 0 && s.type < MARBLE_TYPES.length) || !(s.loc >= 0 && s.loc < LOCATIONS.length))) return null;
     return r;
   } catch (e) { return null; }
 }
 function saveRound() {
   try { if (S.round) localStorage.setItem(STORAGE_KEY, JSON.stringify(S.round)); } catch (e) { /* storage full / private mode */ }
 }
-/** Creates a fresh round: assigns types to slots and (for camera mode) a direction to each marble. */
+/**
+ * Creates a fresh round. Marbles are split evenly between LOCATIONS; each slot remembers its location (loc),
+ * so progress is saved per location. Camera mode also gets a fixed direction for each marble.
+ */
 function newRound() {
-  const n = MARBLE_COUNT;
-  // Share marbles evenly between types, grouped by type so the score bar looks tidy.
-  const types = Array.from({ length: n }, (_, i) => i % MARBLE_TYPES.length).sort((a, b) => a - b);
-  // Spread directions evenly all around the player (360°), then shuffle so types are mixed.
-  const yaws = shuffle(Array.from({ length: n }, (_, i) => (i / n) * Math.PI * 2 + rand(-0.3, 0.3) * (Math.PI / n)));
-  S.round = {
-    v: 1, total: n, elapsedMs: 0, finished: false,
-    slots: types.map((type, i) => ({
-      type, collected: false,
-      yaw: yaws[i],
+  const n = MARBLE_COUNT, L = LOCATIONS.length, T = MARBLE_TYPES.length;
+  const slots = [];
+  for (let loc = 0; loc < L; loc++) {
+    const count = Math.floor(n / L) + (loc < n % L ? 1 : 0); // any remainder goes to the first locations
+    // Spread this location's marbles all around the player (360°), shuffled so colours are mixed.
+    const yaws = shuffle(Array.from({ length: count }, (_, k) => (k / count) * Math.PI * 2 + rand(-0.3, 0.3) * (Math.PI / count)));
+    const group = yaws.map((yaw, k) => ({
+      loc, type: k % T, collected: false, yaw,
       pitch: rand(CAMERA_PITCH_MIN_DEG, CAMERA_PITCH_MAX_DEG) * DEG,
       dist: rand(CAMERA_DISTANCE_MIN, CAMERA_DISTANCE_MAX),
-    })),
-  };
+    }));
+    group.sort((a, b) => a.type - b.type); // tidy score bar: grouped by location, then colour
+    slots.push(...group);
+  }
+  S.round = { v: 2, total: n, locCount: L, elapsedMs: 0, finished: false, slots };
   saveRound();
 }
 const collectedCount = () => S.round ? S.round.slots.filter((s) => s.collected).length : 0;
@@ -821,6 +908,9 @@ function collect(m) {
   flyToSlot(m.slot, MARBLE_TYPES[m.type].color, from, sizePx, () => {
     fillSlot(m.slot, true);
     if (allCollected()) setTimeout(win, 300);
+    else if (!DEBUG_SKIP_LOCATION && inZone() && !remainingSlots().length) {
+      toast(`All marbles at ${LOCATIONS[geo.zone].name} found! ${othersRemainingText(geo.zone)}`, 4500);
+    }
   });
 }
 
@@ -860,9 +950,10 @@ let slotEls = [];
 function buildSlots() {
   slotsEl.innerHTML = '';
   slotsEl.style.setProperty('--slot', MARBLE_COUNT > 14 ? '18px' : '24px');
-  slotEls = S.round.slots.map((s) => {
+  slotEls = S.round.slots.map((s, i) => {
     const el = document.createElement('div');
     el.className = 'slot';
+    if (i > 0 && s.loc !== S.round.slots[i - 1].loc) el.classList.add('loc-start');
     paintMarbleEl(el, MARBLE_TYPES[s.type].color);
     slotsEl.appendChild(el);
     if (s.collected) el.classList.add('marble-css');
@@ -876,6 +967,7 @@ function fillSlot(i, animate) {
   const el = slotEls[i];
   if (!el) return;
   el.classList.add('marble-css', 'filled');
+  updateZoneLabel();
   countNum.textContent = collectedCount();
   if (animate) {
     playClink();
@@ -912,13 +1004,16 @@ function nextToast() {
   toastEl.classList.add('show');
   setTimeout(() => { toastEl.classList.remove('show'); setTimeout(nextToast, 300); }, item[1]);
 }
-function clearToasts() { toastQueue.length = 0; }
+/** Drops queued toasts and hides the current one (used when the location changes, so old news isn't shown). */
+function clearToasts() { toastQueue.length = 0; toastEl.classList.remove('show'); }
 
 function hideScreens() { startScreen.hidden = winScreen.hidden = errorScreen.hidden = true; }
 
 function showStart(msg = '') {
   hideScreens();
+  hideGate();
   hud.hidden = reticleEl.hidden = scanPanel.hidden = trackingEl.hidden = true;
+  zoneLabel.hidden = gpsHint.hidden = true;
   startScreen.hidden = false;
   startMsg.textContent = msg;
   const saved = S.round && !S.round.finished && !allCollected() && (collectedCount() > 0 || S.round.elapsedMs > 1000);
@@ -954,6 +1049,8 @@ const ERRORS = {
   'insecure': ['🔒', 'Secure connection needed', 'Camera access only works over HTTPS. Open this page with an https:// address.'],
   'unsupported': ['📵', 'Device not supported',
     'This browser cannot open the camera. Use Chrome on Android or Safari on iPhone (iOS 16.4 or newer).'],
+  'no-geo': ['📍', 'Location not available',
+    'This browser cannot share your location, and marbles only appear at their spots. Use Chrome on Android or Safari on iPhone.'],
   'webgl': ['🧊', '3D graphics unavailable', 'Your browser has WebGL turned off or does not support it, so the marbles cannot be drawn.'],
 };
 function showError(kind, err) {
@@ -961,15 +1058,18 @@ function showError(kind, err) {
   const [icon, title, text] = ERRORS[kind] || ERRORS['camera-error'];
   stopGameLoop();
   S.phase = 'error';
+  if (!xr.session) S.mode = null;
   hideScreens();
+  hideGate();
+  zoneLabel.hidden = gpsHint.hidden = true;
   hud.hidden = reticleEl.hidden = scanPanel.hidden = trackingEl.hidden = true;
   $('#errIcon').textContent = icon;
   $('#errTitle').textContent = title;
   $('#errText').textContent = text;
-  const canRetry = !['insecure', 'webgl', 'unsupported', 'no-camera'].includes(kind);
+  const canRetry = !['insecure', 'webgl', 'unsupported', 'no-camera', 'no-geo'].includes(kind);
   $('#errRetry').hidden = !canRetry;
   // "Play without camera" lets people still enjoy the game (marbles float in a virtual room).
-  $('#errAlt').hidden = kind === 'insecure' || kind === 'webgl';
+  $('#errAlt').hidden = ['insecure', 'webgl', 'no-geo'].includes(kind);
   $('#errAlt').textContent = kind === 'xr-denied' ? 'Use simple camera mode' : 'Play without camera';
   $('#errAlt').dataset.kind = kind;
   errorScreen.hidden = false;
@@ -984,15 +1084,309 @@ function startGame(fresh) {
   if (!support.webgl) return showError('webgl');
   if (!support.secure) return showError('insecure');
   if (!support.xr && !support.camera) return showError('unsupported');
+  if (!DEBUG_SKIP_LOCATION && !('geolocation' in navigator)) return showError('no-geo');
 
   if (fresh || !S.round || S.round.finished || allCollected()) newRound();
   buildSlots();
   hideScreens();
+
+  // Location already allowed (or check switched off): open the camera / AR straight from this tap.
+  if (DEBUG_SKIP_LOCATION || geo.perm === 'granted') { beginSession(); return; }
+
+  // Otherwise ask for location first. AR and the iPhone motion prompt must be started from a tap, and the
+  // location prompt would use that tap up, so once location is allowed the player taps once more.
+  S.phase = 'locating';
+  showGate('asking');
+  startGeoWatch();
+}
+
+/** Starts the camera (or AR) session and keeps following the player's position. */
+function beginSession() {
+  if (S.busy) return;
   S.busy = true;
+  S.phase = 'starting';
+  hideGate();
   // NOTE: requestSession / requestPermission are the first calls in these functions, so they still
   // run inside the tap ("user activation"), which browsers require.
   const p = support.xr ? startXR().catch(onXRStartFailed) : startCameraMode();
+  startGeoWatch(); // no-op if already watching
   p.finally(() => { S.busy = false; });
+}
+
+// =====================================================================
+//  Location gating (Geolocation API)
+// =====================================================================
+const geo = {
+  watchId: null,
+  perm: 'unknown',     // browser permission state if known: granted | prompt | denied | unknown
+  status: 'idle',      // idle | asking | ok | denied | unavailable
+  fix: null,           // last position { lat, lng }
+  accuracy: Infinity,  // metres, from the last reading
+  lost: false,         // signal dropped after we already had a position
+  dists: [],           // metres from the player to each LOCATIONS entry
+  nearest: -1,         // index of the nearest location
+  zone: null,          // null = not known yet, -1 = outside all zones, n = inside LOCATIONS[n]
+  outsideCount: 0,     // consecutive readings outside the current zone
+  timeouts: 0,
+};
+const inZone = () => typeof geo.zone === 'number' && geo.zone >= 0;
+/** Does this marble slot belong to where the player is right now? */
+const slotActive = (s) => DEBUG_SKIP_LOCATION || s.loc === geo.zone;
+const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
+/** Great-circle distance in metres between two lat/lng points (haversine formula). */
+function haversine(lat1, lng1, lat2, lng2) {
+  const R = 6371000; // mean Earth radius, metres
+  const dLat = (lat2 - lat1) * DEG, dLng = (lng2 - lng1) * DEG;
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat1 * DEG) * Math.cos(lat2 * DEG) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(a)));
+}
+function formatDistance(m) {
+  if (m < 1000) return `${Math.round(m)} m`;
+  return `${(m / 1000).toFixed(m < 10000 ? 1 : 0)} km`;
+}
+/** "A or B", "A, B or C" */
+function placeList() {
+  const names = LOCATIONS.map((l) => l.name);
+  return names.length < 2 ? names.join('') : `${names.slice(0, -1).join(', ')} or ${names[names.length - 1]}`;
+}
+function othersRemainingText(exceptLoc) {
+  const parts = LOCATIONS.map((l, i) => [l, i === exceptLoc ? 0 : S.round.slots.filter((s) => s.loc === i && !s.collected).length])
+    .filter(([, n]) => n > 0)
+    .map(([l, n]) => `${n} more at ${l.name}`);
+  return parts.length ? parts.join(', ') + '.' : '';
+}
+/** Link that opens a location in the phone's maps app (Apple Maps on iPhone, Google Maps elsewhere). */
+function mapsUrl(l) {
+  return isIOS
+    ? `https://maps.apple.com/?ll=${l.lat},${l.lng}&q=${encodeURIComponent(l.name)}`
+    : `https://www.google.com/maps/search/?api=1&query=${l.lat},${l.lng}`;
+}
+
+function startGeoWatch() {
+  if (DEBUG_SKIP_LOCATION || geo.watchId !== null) return;
+  if (!('geolocation' in navigator)) { onGeoError({ code: 2 }); return; }
+  if (geo.status !== 'ok') geo.status = 'asking';
+  geo.watchId = navigator.geolocation.watchPosition(onGeoPosition, onGeoError,
+    { enableHighAccuracy: true, maximumAge: 1000, timeout: 20000 });
+}
+function stopGeoWatch() {
+  if (geo.watchId !== null) { try { navigator.geolocation.clearWatch(geo.watchId); } catch (e) { /* ignore */ } }
+  geo.watchId = null;
+  geo.fix = null; geo.zone = null; geo.nearest = -1; geo.accuracy = Infinity;
+  geo.outsideCount = 0; geo.timeouts = 0; geo.lost = false;
+  if (geo.status !== 'denied') geo.status = 'idle';
+  updateGpsHint();
+}
+/** "Try again" on the location error screens. */
+function restartGeoWatch() {
+  stopGeoWatch();
+  geo.status = 'asking';
+  if (S.phase === 'locating') showGate('asking');
+  else if (S.mode) goAway('finding');
+  startGeoWatch();
+}
+
+function onGeoPosition(pos) {
+  const { latitude, longitude, accuracy } = pos.coords;
+  geo.status = 'ok'; geo.perm = 'granted'; geo.timeouts = 0; geo.lost = false;
+  geo.fix = { lat: latitude, lng: longitude };
+  geo.accuracy = accuracy == null ? Infinity : accuracy;
+  geo.dists = LOCATIONS.map((l) => haversine(latitude, longitude, l.lat, l.lng));
+  geo.nearest = geo.dists.indexOf(Math.min(...geo.dists));
+
+  // Which zone is the player in right now? (closest one within the radius)
+  let inside = -1;
+  geo.dists.forEach((d, i) => { if (d <= RADIUS_METERS && (inside < 0 || d < geo.dists[inside])) inside = i; });
+
+  // Entering is immediate; leaving needs several readings in a row so marbles don't flicker at the edge.
+  let next = geo.zone;
+  if (inside >= 0) { next = inside; geo.outsideCount = 0; }
+  else if (!inZone()) next = -1;
+  else if (++geo.outsideCount >= EXIT_CONFIRM_READINGS) next = -1;
+
+  updateGpsHint();
+  if (S.phase === 'locating') geoGranted();
+  if (next !== geo.zone) {
+    geo.zone = next;
+    geo.outsideCount = 0;
+    if (S.mode && S.phase !== 'starting') refreshZoneGameplay('zone');
+  }
+  updateGateDistance();
+  updateZoneLabel();
+}
+
+function onGeoError(err) {
+  if (err.code === 1) { // PERMISSION_DENIED
+    geo.status = 'denied'; geo.perm = 'denied';
+    stopGeoWatch();
+    if (S.phase === 'locating') showGate('denied');
+    else if (S.mode && S.phase !== 'won' && S.phase !== 'error') goAway('denied');
+    return;
+  }
+  // POSITION_UNAVAILABLE or TIMEOUT. With a previous position, keep the current zone and just warn.
+  if (geo.fix) { geo.lost = true; updateGpsHint(); return; }
+  if (err.code === 3 && ++geo.timeouts < 2) return; // first timeout: keep waiting
+  geo.status = 'unavailable';
+  if (S.phase === 'locating') showGate('unavailable');
+  else if (S.mode && S.phase !== 'won' && S.phase !== 'error') goAway('unavailable');
+}
+
+/** Location was allowed while the player waited on the "Allow location" screen. */
+function geoGranted() {
+  if (S.phase !== 'locating') return;
+  const needsTap = support.xr || (window.DeviceOrientationEvent && typeof DeviceOrientationEvent.requestPermission === 'function');
+  if (needsTap) { if (gate.variant !== 'ready') showGate('ready'); }
+  else beginSession(); // e.g. Android camera mode: nothing else needs a tap
+}
+
+function updateGpsHint() {
+  const active = !DEBUG_SKIP_LOCATION && geo.watchId !== null && !['start', 'won', 'error'].includes(S.phase);
+  let msg = '';
+  if (active && geo.lost) msg = 'GPS signal lost. Move to open sky.';
+  else if (active && geo.fix && geo.accuracy > ACCURACY_WARN_METERS) {
+    msg = `Weak GPS signal (±${Math.round(geo.accuracy)} m). Move to open sky for a better fix.`;
+  }
+  gpsHint.textContent = msg;
+  gpsHint.hidden = !msg;
+}
+
+/** Small label under the score bar with the current location; dims the other location's slots. */
+function updateZoneLabel() {
+  const show = S.mode && ['playing', 'scanning', 'placing'].includes(S.phase);
+  let text = '';
+  if (show && DEBUG_SKIP_LOCATION) text = '🛠 Debug: location check is off';
+  else if (show && inZone()) {
+    const here = S.round.slots.filter((s) => s.loc === geo.zone);
+    text = `📍 ${LOCATIONS[geo.zone].name} · ${here.filter((s) => s.collected).length} / ${here.length} found here`;
+  }
+  zoneLabel.textContent = text;
+  zoneLabel.hidden = !text;
+  slotEls.forEach((el, i) => el.classList.toggle('other', !DEBUG_SKIP_LOCATION && inZone() && S.round.slots[i].loc !== geo.zone));
+}
+
+// ---------- Gate screen ----------
+const gate = { variant: null, action: null };
+function showGate(variant) {
+  gate.variant = variant;
+  gate.action = null;
+  const inSession = !!S.mode;
+  const V = {
+    asking: ['📍', 'Allow location access',
+      `Marbles only appear at ${LOCATIONS.length} spots in ${AREA_NAME}, so the game needs your location to check where you are. It is only used on your phone.`],
+    ready: ['✅', 'Location is on',
+      support.xr ? 'Tap below to start AR and look for marbles.' : 'Tap below to open the camera and look for marbles.'],
+    finding: ['', 'Finding your location…', 'This can take a few seconds. Being outdoors under open sky helps.'],
+    outside: ['🗺️', `You need to be at ${placeList()} in ${AREA_NAME} to find marbles.`,
+      'Your progress is saved. The marbles appear as soon as you arrive.'],
+    denied: ['📍', 'Location access needed',
+      'Marbles only appear at their spots, so the game needs your location. Allow it for this site, then tap Try again. ' +
+      (isIOS ? 'iPhone: Settings → Privacy & Security → Location Services → Safari Websites → While Using the App.'
+             : 'Chrome: tap the icon next to the address bar → Permissions → Location → Allow.')],
+    unavailable: ['📡', "Can't find your location",
+      "Turn on Location (GPS) in your phone's settings and make sure you have signal, then tap Try again."],
+  }[variant];
+  gateIcon.textContent = V[0];
+  gateIcon.classList.toggle('spinner', variant === 'finding');
+  gateTitle.textContent = V[1];
+  gateText.textContent = V[2];
+
+  if (variant === 'ready') gate.action = () => beginSession();
+  if (variant === 'denied' || variant === 'unavailable') gate.action = restartGeoWatch;
+  gatePrimary.hidden = !gate.action;
+  gatePrimary.textContent = variant === 'ready' ? (support.xr ? 'Start AR' : 'Open camera') : 'Try again';
+  gateBack.textContent = inSession ? 'Exit to menu' : 'Back';
+
+  gateDistance.hidden = gateMaps.hidden = variant !== 'outside';
+  updateGateDistance();
+  gateScreen.hidden = false;
+}
+function hideGate() { gate.variant = null; gateScreen.hidden = true; }
+
+/** Live "Nearest: … — 340 m away" line and the maps button on the outside screen. */
+function updateGateDistance() {
+  if (gate.variant !== 'outside') return;
+  if (!geo.fix || geo.nearest < 0) { gateDistance.textContent = 'Finding your location…'; gateMaps.hidden = true; return; }
+  const l = LOCATIONS[geo.nearest];
+  gateDistance.textContent = `Nearest: ${l.name} — ${formatDistance(geo.dists[geo.nearest])} away`;
+  gateMaps.href = mapsUrl(l);
+  gateMaps.setAttribute('aria-label', `Open ${l.address} in Maps`);
+  gateMaps.hidden = false;
+}
+
+/**
+ * Decides what the player sees for the current position: the location gate, or the marbles of the
+ * location they are standing at. Called when a session starts, when the zone changes and on "Play again".
+ */
+function refreshZoneGameplay(reason = 'zone') {
+  if (!S.mode || S.phase === 'won' || S.phase === 'error') return;
+  if (!DEBUG_SKIP_LOCATION) {
+    if (geo.status === 'denied') return goAway('denied');
+    if (geo.zone === null) return goAway(geo.status === 'unavailable' ? 'unavailable' : 'finding');
+    if (geo.zone === -1) return goAway('outside');
+  }
+  const zone = DEBUG_SKIP_LOCATION ? 'all' : geo.zone;
+  if (reason === 'zone') clearToasts();
+  hideGate();
+  clearMarbles();
+  if (S.mode === 'xr' && xr.candZone !== zone) {
+    // Surfaces scanned at another place are useless here: start a fresh scan for this location.
+    xr.candidates.clear();
+    scanGeo.setDrawRange(0, 0);
+    xr.placed.clear();
+    xr.candZone = zone;
+  }
+  const need = remainingSlots().length;
+  if (S.mode === 'camera' || need === 0) {
+    spawnCameraMarbles();   // camera mode; in AR this branch only runs when nothing is left here, so it adds nothing
+    enterPlaying();
+  } else if (xr.candidates.size >= need || remainingSlots().every((i) => xr.placed.has(i))) {
+    S.phase = 'placing';    // this place was scanned earlier in the session: hide the marbles right away
+    hud.hidden = false; scanPanel.hidden = true; reticleEl.hidden = true;
+    xr.pendingPlacement = true;
+  } else {
+    beginScanning();
+  }
+  updateZoneLabel();
+  updateGpsHint();
+
+  if (reason === 'again') toast(DEBUG_SKIP_LOCATION ? `${MARBLE_COUNT} new marbles hidden. Go!` : `New round! ${need} marbles to find here.`);
+  else if (!DEBUG_SKIP_LOCATION) {
+    const name = LOCATIONS[geo.zone].name;
+    toast(need ? `📍 You're at ${name}: ${need} marble${need === 1 ? '' : 's'} to find here.`
+               : `You've found every marble at ${name}. ${othersRemainingText(geo.zone)}`, 4000);
+  }
+}
+
+/** Hides the marbles and shows the gate (outside a zone, waiting for GPS, or a location problem). */
+function goAway(variant) {
+  if (S.phase !== 'away') clearToasts();
+  clearMarbles();
+  xr.pendingPlacement = false;
+  S.phase = 'away';
+  reticleEl.hidden = true;
+  reticle3D.visible = false;
+  scanPanel.hidden = true;
+  scanPoints.visible = false;
+  surfaceRing.visible = false;
+  hud.hidden = false;
+  showGate(variant);
+  updateZoneLabel();
+  updateGpsHint();
+}
+
+/** Leaves the game and returns to the start screen (progress stays saved). */
+function goHome() {
+  stopGeoWatch();
+  hideGate();
+  if (xr.session) { xr.session.end(); return; } // the session's end handler shows the start screen
+  stopCamera();
+  stopGameLoop();
+  clearMarbles();
+  gridSphere.visible = false;
+  S.mode = null;
+  S.phase = 'start';
+  showStart();
 }
 
 function onXRStartFailed(err) {
@@ -1070,6 +1464,7 @@ function enterPlaying() {
   const noOverlay = S.mode === 'xr' && !xr.hasOverlay;
   reticleEl.hidden = noOverlay;
   reticle3D.visible = noOverlay;
+  updateZoneLabel();
   if (allCollected()) setTimeout(win, 300);
 }
 
@@ -1081,6 +1476,8 @@ function win() {
   resetFocus();
   reticleEl.hidden = true;
   reticle3D.visible = false;
+  updateZoneLabel();
+  updateGpsHint();
   playWinSound();
   vibrate([80, 60, 80, 60, 160]);
   // Without a DOM overlay the win screen would be invisible in AR, so leave AR first (the end handler shows it).
@@ -1094,17 +1491,10 @@ function playAgain() {
   buildSlots();
   winScreen.hidden = true;
   clearMarbles();
-  if (S.mode === 'xr' && xr.session) {
-    if (xr.candidates.size >= MARBLE_COUNT) {          // room already scanned: hide straight away
-      S.phase = 'placing';
-      xr.pendingPlacement = true;
-    } else {
-      beginScanning();
-    }
-  } else if (S.mode === 'camera') {
-    spawnCameraMarbles();
-    enterPlaying();
-    toast(`${MARBLE_COUNT} new marbles hidden. Go!`);
+  xr.placed.clear();      // new marbles get new spots (scanned surfaces are kept)
+  if (S.mode && (S.mode === 'camera' || xr.session)) {
+    S.phase = 'playing';  // leave the 'won' state so the refresh below runs
+    refreshZoneGameplay('again');
   } else {
     startGame(false);
   }
@@ -1116,6 +1506,8 @@ function playAgain() {
 const xr = {
   session: null, refSpace: null, viewerSpace: null, hitSources: [], hasOverlay: false,
   candidates: new Map(),        // surface spots found while scanning (key = grid cell)
+  candZone: undefined,          // which location the scanned spots belong to
+  placed: new Map(),            // slot index → spot, so a marble keeps its spot when you leave and come back
   viewer: new THREE.Vector3(),
   frameCount: 0, scanStart: 0, pendingPlacement: false, lostSince: 0,
 };
@@ -1158,10 +1550,12 @@ async function startXR() {
   clearMarbles();
   xr.candidates.clear();
   scanGeo.setDrawRange(0, 0);
+  xr.placed.clear();
+  xr.candZone = undefined;
   xr.frameCount = 0;
-  beginScanning();
   startGameLoop();
   toast('Full AR mode: marbles will hide on your real floor and furniture.', 3500);
+  refreshZoneGameplay('start'); // scan and hide marbles if at a marble spot, otherwise show the location screen
 }
 
 // Tapping overlay buttons / the score bar must not also count as a tap in the AR scene.
@@ -1184,7 +1578,8 @@ placeBtn.addEventListener('click', () => {
   if (S.phase === 'scanning' && xr.candidates.size >= remainingSlots().length) xr.pendingPlacement = true;
 });
 
-const remainingSlots = () => S.round.slots.map((s, i) => (s.collected ? -1 : i)).filter((i) => i >= 0);
+/** Uncollected marbles that belong to the player's current location. */
+const remainingSlots = () => S.round.slots.map((s, i) => (!s.collected && slotActive(s) ? i : -1)).filter((i) => i >= 0);
 
 /** Runs every AR frame: tracking, room scanning, placing marbles, keeping anchors in sync. */
 function xrFrame(frame) {
@@ -1201,9 +1596,11 @@ function xrFrame(frame) {
   xr.viewer.set(p.x, p.y, p.z);
 
   const scanning = S.phase === 'scanning';
-  // Keep collecting surface spots while playing too (less often) so "Play again" has a fresh map.
-  if (scanning || xr.frameCount % 8 === 0) collectHitSpots(frame, scanning);
-  if (xr.frameCount % (scanning ? 12 : 45) === 0) collectPlaneSpots(frame);
+  // Keep collecting surface spots while playing too (less often) so "Play again" has a fresh map,
+  // but not while away from a marble location: those spots would belong to the wrong place.
+  const mapping = scanning || S.phase === 'playing' || S.phase === 'placing';
+  if (mapping && (scanning || xr.frameCount % 8 === 0)) collectHitSpots(frame, scanning);
+  if (mapping && xr.frameCount % (scanning ? 12 : 45) === 0) collectPlaneSpots(frame);
   if (scanning && xr.frameCount % 6 === 0) updateScanUI();
 
   if (xr.pendingPlacement) {
@@ -1296,20 +1693,27 @@ function updateScanUI() {
   if (found >= target && performance.now() - xr.scanStart > SCAN_MIN_SECONDS * 1000) xr.pendingPlacement = true;
 }
 
-/** Picks spots that are as far from each other as possible ("farthest point sampling"). */
-function spreadPick(points, n) {
+/**
+ * Picks n spots that are as far from each other as possible ("farthest point sampling"),
+ * also keeping away from spots already in use (existing).
+ */
+function spreadPick(points, n, existing = []) {
   const pool = shuffle(points.slice());
-  if (!pool.length) return [];
+  const chosen = [];
+  if (n <= 0 || !pool.length) return chosen;
   const d2 = (a, b) => (a.x - b.x) ** 2 + (a.z - b.z) ** 2 + ((a.y - b.y) * 2) ** 2;
-  const chosen = [pool.pop()];
-  const minD = pool.map((p) => d2(p, chosen[0]));
+  const minD = pool.map((p) => existing.reduce((m, e) => Math.min(m, d2(p, e)), Infinity));
+  const take = (i) => {
+    const p = pool[i];
+    pool.splice(i, 1); minD.splice(i, 1);
+    chosen.push(p);
+    for (let j = 0; j < pool.length; j++) minD[j] = Math.min(minD[j], d2(pool[j], p));
+  };
+  if (!existing.length) take(pool.length - 1); // random start
   while (chosen.length < n && pool.length) {
     let best = 0;
     for (let i = 1; i < pool.length; i++) if (minD[i] > minD[best]) best = i;
-    const p = pool[best];
-    chosen.push(p);
-    pool.splice(best, 1); minD.splice(best, 1);
-    for (let i = 0; i < pool.length; i++) minD[i] = Math.min(minD[i], d2(pool[i], p));
+    take(best);
   }
   return chosen;
 }
@@ -1317,10 +1721,17 @@ function spreadPick(points, n) {
 function placeMarblesXR(frame) {
   clearMarbles();
   const slots = remainingSlots();
-  const spots = spreadPick([...xr.candidates.values()], slots.length);
-  slots.forEach((slotIdx, k) => {
-    const base = spots[k % spots.length].clone();
-    if (k >= spots.length) base.x += rand(-0.15, 0.15); // only if there were too few spots
+  // Marbles placed earlier at this location keep their spot; the others get new, well-spread spots.
+  const missing = slots.filter((i) => !xr.placed.has(i));
+  const kept = slots.filter((i) => xr.placed.has(i)).map((i) => xr.placed.get(i));
+  const fresh = spreadPick([...xr.candidates.values()], missing.length, kept);
+  missing.forEach((slotIdx, k) => {
+    const base = fresh.length ? fresh[k % fresh.length].clone() : xr.viewer.clone().setY(xr.viewer.y - 1.4);
+    if (k >= fresh.length) base.x += rand(-0.15, 0.15); // only if there were too few spots
+    xr.placed.set(slotIdx, base);
+  });
+  slots.forEach((slotIdx) => {
+    const base = xr.placed.get(slotIdx).clone();
     const m = createMarble(slotIdx, S.round.slots[slotIdx].type, MARBLE_RADIUS_AR, true);
     m.root.position.copy(base);
     world.add(m.root);
@@ -1355,6 +1766,8 @@ function onXREnd() {
   xr.pendingPlacement = false;
   clearMarbles();
   stopGameLoop();
+  stopGeoWatch();
+  hideGate();
   renderer.xr.enabled = false;
   scanPoints.visible = surfaceRing.visible = reticle3D.visible = false;
   S.mode = null;
@@ -1425,12 +1838,11 @@ async function startCameraMode({ noCamera = false } = {}) {
   updateCameraFov();
 
   clearMarbles();
-  spawnCameraMarbles();
-  enterPlaying();
   startGameLoop();
 
   toast(noCamera ? 'Virtual mode: no camera, marbles float around you.'
                  : 'Camera mode: turn and tilt your phone to look around your room.', 3500);
+  refreshZoneGameplay('start'); // spawn marbles if at a marble spot, otherwise show the location screen
   setTimeout(() => {
     if (S.mode !== 'camera') return;
     if (!orient.has) {
@@ -1438,7 +1850,7 @@ async function startCameraMode({ noCamera = false } = {}) {
       toast(motion === 'denied' ? 'Motion access was denied. Drag the screen to look around.'
                                 : 'No motion sensor found. Drag the screen to look around.', 3500);
     }
-    toast(`Hold the ring on a marble for ${FOCUS_TIME_MS / 1000} s, or tap it.`, 3500);
+    if (S.phase === 'playing') toast(`Hold the ring on a marble for ${FOCUS_TIME_MS / 1000} s, or tap it.`, 3500);
   }, 1500);
 }
 
@@ -1448,10 +1860,10 @@ function stopCamera() {
   video.style.display = 'none';
 }
 
-/** Places marbles at fixed directions around the player (saved per round so a reload keeps them). */
+/** Places the current location's marbles at fixed directions around the player (saved, so a reload keeps them). */
 function spawnCameraMarbles() {
   S.round.slots.forEach((s, i) => {
-    if (s.collected) return;
+    if (s.collected || !slotActive(s)) return; // only the current location's marbles
     const m = createMarble(i, s.type, MARBLE_RADIUS_CAMERA, false);
     const cp = Math.cos(s.pitch);
     m.root.position.set(-Math.sin(s.yaw) * cp * s.dist, Math.sin(s.pitch) * s.dist, -Math.cos(s.yaw) * cp * s.dist);
@@ -1519,14 +1931,18 @@ newGameBtn.addEventListener('click', () => startGame(true));
 againBtn.addEventListener('click', playAgain);
 
 $('#errRetry').addEventListener('click', () => startGame(false));
-$('#errBack').addEventListener('click', () => { S.phase = 'start'; showStart(); });
+$('#errBack').addEventListener('click', goHome);
 $('#errAlt').addEventListener('click', () => {
   ensureAudio();
   hideScreens();
   buildSlots();
   // From an XR refusal, "simple camera mode" still tries the camera; otherwise play without it.
+  S.phase = 'starting';
   startCameraMode({ noCamera: $('#errAlt').dataset.kind !== 'xr-denied' });
+  startGeoWatch(); // after startCameraMode, whose iPhone motion prompt must come first in the tap
 });
+gatePrimary.addEventListener('click', () => { ensureAudio(); if (gate.action) gate.action(); });
+gateBack.addEventListener('click', goHome);
 
 // Restart needs two taps (a confirm dialog can't be shown inside AR).
 let restartTimer = 0;
@@ -1535,7 +1951,7 @@ restartBtn.addEventListener('click', () => {
     clearTimeout(restartTimer);
     restartBtn.classList.remove('armed');
     restartBtn.textContent = '↻';
-    if (S.phase === 'playing' || S.phase === 'scanning') playAgain();
+    if (['playing', 'scanning', 'placing', 'away'].includes(S.phase)) playAgain();
     return;
   }
   restartBtn.classList.add('armed');
@@ -1580,6 +1996,25 @@ async function detectSupport() {
 
   support.ready = true;
   startBtn.disabled = false;
+}
+
+// Keep the label / hint / toast stack just under the score bar, whatever its height.
+function layoutHud() {
+  const r = hud.hidden ? null : hud.getBoundingClientRect();
+  overlayEl.style.setProperty('--hud-bottom', r && r.height ? r.bottom + 'px' : 'env(safe-area-inset-top, 0px)');
+}
+if (window.ResizeObserver) new ResizeObserver(layoutHud).observe(hud);
+addEventListener('resize', layoutHud);
+
+// If location was already allowed earlier, the Start tap can open the camera / AR immediately.
+if (navigator.permissions && navigator.permissions.query && !DEBUG_SKIP_LOCATION) {
+  navigator.permissions.query({ name: 'geolocation' }).then((st) => {
+    geo.perm = st.state;
+    st.onchange = () => {
+      geo.perm = st.state;
+      if (st.state === 'granted' && S.phase === 'locating') geoGranted();
+    };
+  }).catch(() => { /* not supported (older Safari): we simply ask on Start */ });
 }
 
 S.round = loadRound();
