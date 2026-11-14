@@ -9,6 +9,54 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <title>Marble Hunt AR</title>
 
+<!--
+  Debug panel: open the page with ?debug=1 to see WebXR support, the chosen mode, the session result,
+  enabled features and any uncaught errors on screen (useful inside the App Clip, which has no console).
+  This plain script runs before the game module, so it also catches errors that stop the module loading.
+-->
+<script>
+(function () {
+  var on = /[?&]debug=1(&|$)/.test(location.search);
+  var state = {}, order = [], lines = [];
+  function render() {
+    if (!on) return;
+    var el = document.getElementById('debugPanel');
+    if (!el) return;
+    el.hidden = false;
+    var out = order.map(function (k) { return k + ': ' + state[k]; }).join('\n');
+    // newest log lines first, so they are never cut off at the bottom of the panel
+    el.textContent = out + (lines.length ? '\n--- log (newest first) ---\n' + lines.slice().reverse().join('\n') : '');
+  }
+  window.MHDebug = {
+    on: on,
+    set: function (k, v) { if (!(k in state)) order.push(k); state[k] = String(v); render(); },
+    log: function (msg) {
+      lines.push(new Date().toTimeString().slice(0, 8) + ' ' + msg);
+      if (lines.length > 25) lines.shift();
+      render();
+    },
+  };
+  if (!on) return;
+  MHDebug.set('navigator.xr', navigator.xr ? 'exists' : 'MISSING');
+  MHDebug.set('immersive-ar supported', 'checking...');
+  MHDebug.set('mode', '(not started)');
+  MHDebug.set('requestSession', '(not called yet)');
+  MHDebug.set('enabled features', '-');
+  MHDebug.set('sessiongranted', 'not fired');
+  MHDebug.set('user agent', navigator.userAgent);
+  addEventListener('error', function (e) {
+    var t = e.target;
+    if (t && t !== window && (t.src || t.href)) MHDebug.log('LOAD ERROR: ' + (t.src || t.href));
+    else MHDebug.log('ERROR: ' + (e.message || e) + (e.filename ? ' @ ' + e.filename.split('/').pop() + ':' + e.lineno : ''));
+  }, true);
+  addEventListener('unhandledrejection', function (e) {
+    var r = e.reason;
+    MHDebug.log('UNHANDLED REJECTION: ' + (r && r.name ? r.name + ': ' : '') + (r && r.message ? r.message : r));
+  });
+  document.addEventListener('DOMContentLoaded', render);
+})();
+</script>
+
 <!-- Three.js from a CDN via an import map (no build step). -->
 <script type="importmap">
 {
@@ -33,6 +81,7 @@
   }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   [hidden] { display: none !important; }
+  #overlay:xr-overlay { background: transparent !important; }
 
   /* Lock the page: no scrolling, no zooming, no text selection. */
   html, body {
@@ -178,6 +227,7 @@
 
   /* ---------- Location gate (outside a zone, waiting for GPS, permission problems) ---------- */
   #gateScreen { padding-top: calc(var(--hud-bottom, var(--safe-top)) + 24px); }
+  .gate-card { width: min(360px, 100%); display: flex; flex-direction: column; align-items: center; gap: 18px; }
   .gate-icon { font-size: 52px; line-height: 1; }
   .gate-icon.spinner {
     width: 52px; height: 52px; font-size: 0; border-radius: 50%;
@@ -237,6 +287,30 @@
   }
   @media (orientation: landscape) and (max-height: 520px) and (pointer: coarse) { #rotateHint { display: flex; } }
 
+  /* ---------- Debug panel (?debug=1) ---------- */
+  #debugPanel {
+    position: absolute; left: 8px; right: 8px; bottom: calc(var(--safe-bottom) + 8px); z-index: 30;
+    max-height: 36vh; overflow: hidden; padding: 8px 10px; border-radius: 10px;
+    background: rgba(0, 0, 0, .88); color: #9dffb0; white-space: pre-wrap; word-break: break-word;
+    font: 10.5px/1.35 ui-monospace, Menlo, Consolas, monospace;
+    pointer-events: none; /* taps go through to the buttons underneath */
+  }
+
+  /* ---------- During an AR session ----------
+     The camera image is behind the page (in the App Clip it is drawn natively behind the web view),
+     so the page itself must be see-through: only the score bar, reticle and small panels may show. */
+  html.xr-active, html.xr-active body, html.xr-active #scene, html.xr-active #overlay {
+    background: transparent !important; background-image: none !important;
+  }
+  html.xr-active #camera, html.xr-active #startScreen, html.xr-active #rotateHint { display: none !important; }
+  html.xr-active #gateScreen { background: transparent; justify-content: flex-end; padding-bottom: calc(var(--safe-bottom) + 20px); }
+  html.xr-active .gate-card {
+    padding: 18px; border-radius: 22px; background: var(--panel); border: 1px solid rgba(255,255,255,.12);
+    backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+  }
+  html.xr-active .gate-icon { font-size: 34px; }
+  html.xr-active .gate-title { font-size: 18px; }
+
   @media (prefers-reduced-motion: reduce) {
     .hero .marble-css, .trophy .marble-css { animation: none; }
   }
@@ -251,14 +325,16 @@
 
     <!-- Location gate: shown instead of marbles when the player is not at a marble location. -->
     <section id="gateScreen" class="screen ui" hidden>
-      <div class="gate-icon" id="gateIcon">📍</div>
-      <h2 class="gate-title" id="gateTitle"></h2>
-      <p class="lead" id="gateText"></p>
-      <div class="distance" id="gateDistance" hidden></div>
-      <div class="stack">
-        <a id="gateMaps" class="btn" target="_blank" rel="noopener" hidden>Open in Maps</a>
-        <button id="gatePrimary" class="btn" hidden></button>
-        <button id="gateBack" class="btn-ghost">Back</button>
+      <div class="gate-card">
+        <div class="gate-icon" id="gateIcon">📍</div>
+        <h2 class="gate-title" id="gateTitle"></h2>
+        <p class="lead" id="gateText"></p>
+        <div class="distance" id="gateDistance" hidden></div>
+        <div class="stack">
+          <a id="gateMaps" class="btn" target="_blank" rel="noopener" hidden>Open in Maps</a>
+          <button id="gatePrimary" class="btn" hidden></button>
+          <button id="gateBack" class="btn-ghost">Back</button>
+        </div>
       </div>
     </section>
 
@@ -347,6 +423,8 @@
         <button id="errBack" class="btn-ghost">Back</button>
       </div>
     </section>
+
+    <div id="debugPanel" hidden></div>
 
     <div id="rotateHint"><div style="font-size:44px">📱</div>Please turn your phone to portrait</div>
   </div>
@@ -480,6 +558,9 @@ const STORAGE_KEY = 'marble-hunt-ar-v1';
 //  Helpers
 // =====================================================================
 const $ = (sel) => document.querySelector(sel);
+/** On-screen debug panel (?debug=1); defined by the plain script in <head>. */
+const D = window.MHDebug || { on: false, set() {}, log() {} };
+const errText = (e) => (e ? `${e.name || 'Error'}: ${e.message || e}` : 'unknown error');
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
 const rand = (a, b) => a + Math.random() * (b - a);
 const DEG = Math.PI / 180;
@@ -1216,7 +1297,7 @@ const ERRORS = {
   'xr-denied': ['🕶️', 'AR permission declined',
     "The AR session needs permission to use your camera. Tap Try again and accept the prompt, or play without AR (marbles can't stay fixed in the room then)."],
   'xr-failed': ['🕶️', "AR couldn't start",
-    'On Android, make sure "Google Play Services for AR" is installed and up to date, then tap Try again. You can also play without AR, but marbles can\'t stay fixed in the room then.'],
+    'On Android, make sure "Google Play Services for AR" is installed and up to date. On iPhone, open the game again through the App Clip. Then tap Try again.'],
   'motion-denied': ['🧭', 'Motion access blocked',
     'Motion sensors let you look around by moving your phone. You can still play by dragging the screen.'],
   'no-camera': ['📷', 'No camera found', 'We could not find a camera on this device.'],
@@ -1241,11 +1322,12 @@ function showError(kind, err) {
   hud.hidden = reticleEl.hidden = scanPanel.hidden = trackingEl.hidden = true;
   $('#errIcon').textContent = icon;
   $('#errTitle').textContent = title;
-  $('#errText').textContent = text;
+  $('#errText').textContent = (kind === 'xr-denied' || kind === 'xr-failed') && err ? `${text}\n\n(${errText(err)})` : text;
   const canRetry = !['insecure', 'webgl', 'unsupported', 'no-camera', 'no-geo'].includes(kind);
   $('#errRetry').hidden = !canRetry;
   // "Play without camera" lets people still enjoy the game (marbles float in a virtual room).
-  $('#errAlt').hidden = ['insecure', 'webgl', 'no-geo'].includes(kind);
+  $('#errAlt').hidden = ['insecure', 'webgl', 'no-geo'].includes(kind) ||
+    (support.xr && (kind === 'xr-denied' || kind === 'xr-failed')); // WebXR supported: never fall back
   $('#errAlt').textContent = kind === 'xr-denied' || kind === 'xr-failed' ? 'Play without AR' : 'Play without camera';
   $('#errAlt').dataset.kind = kind;
   errorScreen.hidden = false;
@@ -1259,21 +1341,31 @@ function startGame(fresh, { fallback = false } = {}) {
   ensureAudio(); // must happen inside the tap so iOS unlocks sound
   if (!support.webgl) return showError('webgl');
   if (!support.secure) return showError('insecure');
-  S.wantAR = support.xr && !fallback; // WebXR, unless the player chose "Play without AR"
+  // Whenever WebXR immersive-ar is supported (Android Chrome, the iOS App Clip) the game always uses it;
+  // the camera + orientation mode is only for devices without WebXR ("Play without AR").
+  S.wantAR = support.xr;
   if (!S.wantAR && !support.camera) return showError('unsupported');
+  D.set('mode', S.wantAR ? 'WebXR' : 'fallback (camera + orientation)');
   if (!DEBUG_SKIP_LOCATION && !('geolocation' in navigator)) return showError('no-geo');
 
   if (fresh || !S.round || S.round.finished || allCollected()) newRound();
   buildSlots();
   hideScreens();
 
-  // Location already allowed (or check switched off): open the camera / AR straight from this tap.
-  // (AR without a DOM overlay can't show the location screen inside AR, so it checks the zone first.)
-  const checkZoneFirst = S.wantAR && support.xrOverlay === false;
-  if (DEBUG_SKIP_LOCATION || (geo.perm === 'granted' && !checkZoneFirst)) { beginSession(); return; }
+  if (S.wantAR) {
+    // AR: requestSession must be called straight from a tap, and a location prompt in between would use the
+    // tap up. So the location check comes first, here, and "Enter AR" appears once the player is in a zone.
+    if (DEBUG_SKIP_LOCATION) { beginSession(); return; } // this tap itself starts AR
+    S.phase = 'locating';
+    showGate(geo.perm === 'granted' ? 'finding' : 'asking');
+    startGeoWatch();
+    if (geo.status === 'ok') geoGranted(); // position already known
+    return;
+  }
 
-  // Otherwise ask for location first. AR and the iPhone motion prompt must be started from a tap, and the
-  // location prompt would use that tap up, so once location is allowed the player taps once more.
+  // "Play without AR": location already allowed (or check off) → open the camera straight from this tap.
+  if (DEBUG_SKIP_LOCATION || geo.perm === 'granted') { beginSession(); return; }
+  // Otherwise ask for location first (the iPhone motion prompt needs its own tap afterwards).
   S.phase = 'locating';
   showGate('asking');
   startGeoWatch();
@@ -1385,6 +1477,7 @@ function onGeoPosition(pos) {
   else if (++geo.outsideCount >= EXIT_CONFIRM_READINGS) next = -1;
 
   updateGpsHint();
+  if (D.on) D.set('location', `zone ${next} (${next >= 0 ? LOCATIONS[next].name : next === -1 ? 'outside' : '?'}), nearest ${Math.round(geo.dists[geo.nearest])} m, ±${Math.round(geo.accuracy)} m`);
   if (next !== geo.zone) {
     geo.zone = next;
     geo.outsideCount = 0;
@@ -1396,6 +1489,7 @@ function onGeoPosition(pos) {
 }
 
 function onGeoError(err) {
+  D.log(`geolocation error ${err.code}${err.message ? ': ' + err.message : ''}`);
   if (err.code === 1) { // PERMISSION_DENIED
     geo.status = 'denied'; geo.perm = 'denied';
     stopGeoWatch();
@@ -1414,13 +1508,13 @@ function onGeoError(err) {
 /** Location was allowed while the player waited on the "Allow location" screen. */
 function geoGranted() {
   if (S.phase !== 'locating') return;
-  // AR without a DOM overlay can't show the location screen, so only offer "Start AR" once at a marble spot.
-  if (S.wantAR && support.xrOverlay === false && !DEBUG_SKIP_LOCATION) {
+  // AR: only offer "Enter AR" once the player is at a marble spot (the location screen updates live).
+  if (S.wantAR && !DEBUG_SKIP_LOCATION) {
     if (geo.zone === null) { if (gate.variant !== 'finding') showGate('finding'); return; }
     if (geo.zone === -1) { if (gate.variant !== 'outside') showGate('outside'); return; }
   }
   const needsTap = S.wantAR || (window.DeviceOrientationEvent && typeof DeviceOrientationEvent.requestPermission === 'function');
-  if (needsTap) { if (gate.variant !== 'ready') showGate('ready'); }
+  if (needsTap) { if (gate.variant !== 'ready') showGate('ready'); else updateReadyText(); }
   else beginSession(); // e.g. Android camera mode: nothing else needs a tap
 }
 
@@ -1458,8 +1552,9 @@ function showGate(variant) {
   const V = {
     asking: ['📍', 'Allow location access',
       `Marbles only appear at ${LOCATIONS.length} spots in ${AREA_NAME}, so the game needs your location to check where you are. It is only used on your phone.`],
-    ready: ['✅', 'Location is on',
-      S.wantAR ? 'Tap below to start AR and look for marbles.' : 'Tap below to open the camera and look for marbles.'],
+    ready: ['✅', S.wantAR && inZone() ? `You're at ${LOCATIONS[geo.zone].name}` : 'Location is on',
+      S.wantAR ? 'Tap Enter AR, then point your phone at the floor, tables and shelves around you.'
+               : 'Tap below to open the camera and look for marbles.'],
     finding: ['', 'Finding your location…', 'This can take a few seconds. Being outdoors under open sky helps.'],
     outside: ['🗺️', `You need to be at ${placeList()} in ${AREA_NAME} to find marbles.`,
       'Your progress is saved. The marbles appear as soon as you arrive.'],
@@ -1478,7 +1573,7 @@ function showGate(variant) {
   if (variant === 'ready') gate.action = () => beginSession();
   if (variant === 'denied' || variant === 'unavailable') gate.action = restartGeoWatch;
   gatePrimary.hidden = !gate.action;
-  gatePrimary.textContent = variant === 'ready' ? (S.wantAR ? 'Start AR' : 'Open camera') : 'Try again';
+  gatePrimary.textContent = variant === 'ready' ? (S.wantAR ? 'Enter AR' : 'Open camera') : 'Try again';
   gateBack.textContent = inSession ? 'Exit to menu' : 'Back';
 
   gateDistance.hidden = gateMaps.hidden = variant !== 'outside';
@@ -1486,6 +1581,9 @@ function showGate(variant) {
   gateScreen.hidden = false;
 }
 function hideGate() { gate.variant = null; gateScreen.hidden = true; }
+function updateReadyText() {
+  if (gate.variant === 'ready' && S.wantAR && inZone()) gateTitle.textContent = `You're at ${LOCATIONS[geo.zone].name}`;
+}
 
 /** Live "Nearest: … — 340 m away" line and the maps button on the outside screen. */
 function updateGateDistance() {
@@ -1583,6 +1681,8 @@ function goHome() {
 
 function onXRStartFailed(err) {
   console.warn('WebXR failed', err);
+  D.log('AR start failed: ' + errText(err));
+  document.documentElement.classList.remove('xr-active');
   if (xr.session) {
     // Detach our end handler first so it can't reset the camera-mode game we start below.
     xr.session.removeEventListener('end', onXREnd);
@@ -1751,8 +1851,9 @@ const xrHas = (f) => (xr.features ? xr.features.has(f) : true);
  * iPhone/iPad reach it inside the Needle Go App Clip. Only hit-test is required; everything else is optional.
  */
 async function startXR() {
-  // First call: must stay inside the user's tap.
+  // First call: must stay inside the user's tap (or the 'sessiongranted' event). Nothing is awaited before it.
   let session;
+  D.set('requestSession', 'pending...');
   try {
     session = await navigator.xr.requestSession('immersive-ar', {
       requiredFeatures: ['hit-test'],
@@ -1761,14 +1862,27 @@ async function startXR() {
       depthSensing: { usagePreference: ['cpu-optimized'], dataFormatPreference: ['luminance-alpha', 'float32'] },
     });
   } catch (e) {
+    D.set('requestSession', 'FAILED: ' + errText(e));
     if (e && (e.name === 'NotAllowedError' || e.name === 'SecurityError')) throw e;
     // Some WebXR implementations reject optional features they don't know: retry with the bare minimum.
-    session = await navigator.xr.requestSession('immersive-ar', {
-      requiredFeatures: ['hit-test'], optionalFeatures: ['dom-overlay'], domOverlay: { root: overlayEl },
-    });
+    D.log('retrying requestSession with hit-test + dom-overlay only');
+    try {
+      session = await navigator.xr.requestSession('immersive-ar', {
+        requiredFeatures: ['hit-test'], optionalFeatures: ['dom-overlay'], domOverlay: { root: overlayEl },
+      });
+    } catch (e2) { D.set('requestSession', 'FAILED (also minimal retry): ' + errText(e2)); throw e2; }
   }
+  D.set('requestSession', 'OK');
   xr.session = session;
   xr.features = session.enabledFeatures ? new Set(session.enabledFeatures) : null;
+  D.set('enabled features', session.enabledFeatures ? [...session.enabledFeatures].join(', ') || '(none)' : '(not reported)');
+  D.set('dom overlay', session.domOverlayState ? session.domOverlayState.type : 'none');
+
+  // Everything behind the 3D content must be transparent so the camera image shows through.
+  document.documentElement.classList.add('xr-active');
+  scene.background = null;
+  renderer.setClearColor(0x000000, 0);
+  D.set('backgrounds', `html ${getComputedStyle(document.documentElement).backgroundColor}, body ${getComputedStyle(document.body).backgroundColor}`);
   S.mode = 'xr';
   stopCamera();
   gridSphere.visible = false;
@@ -1807,6 +1921,7 @@ async function startXR() {
 
   session.addEventListener('select', onXRSelect);
   session.addEventListener('end', onXREnd);
+  D.set('AR extras', `anchors ${xr.anchors ? 'yes' : 'no'}, depth ${xr.depth ? 'yes' : 'no'}, light ${xr.lightProbe ? 'yes' : 'no'}, hit-test sources ${xr.hitSources.length}`);
 
   clearMarbles();
   xr.candidates.clear();
@@ -1822,7 +1937,7 @@ async function startXR() {
 
 // Tapping overlay buttons / the score bar must not also count as a tap in the AR scene.
 overlayEl.addEventListener('beforexrselect', (e) => {
-  if (e.target.closest && e.target.closest('button, #hud, .panel, .screen')) e.preventDefault();
+  if (e.target.closest && e.target.closest('button, a, #hud, .panel, .screen, #debugPanel')) e.preventDefault();
 });
 
 function beginScanning() {
@@ -1847,6 +1962,7 @@ const remainingSlots = () => S.round.slots.map((s, i) => (!s.collected && slotAc
 function xrFrame(frame) {
   xr.frameCount++;
   const pose = frame.getViewerPose(xr.refSpace);
+  if (D.on && xr.frameCount % 30 === 1) D.set('XR frames', `${xr.frameCount}, viewer pose ${pose ? 'ok' : 'none'}, phase ${S.phase}`);
   if (!pose) {
     if (!xr.lostSince) xr.lostSince = performance.now();
     trackingEl.hidden = performance.now() - xr.lostSince < 600;
@@ -2037,6 +2153,8 @@ function onXRSelect(e) {
 }
 
 function onXREnd() {
+  D.log('AR session ended');
+  document.documentElement.classList.remove('xr-active');
   const toGate = xr.endToGate;  // set when AR without DOM overlay had to close to show the location screen
   xr.endToGate = null;
   xr.hitSources.forEach((s) => { try { s.cancel(); } catch (e) { /* ignore */ } });
@@ -2087,6 +2205,7 @@ function onDeviceOrientation(e) {
 
 async function startCameraMode({ noCamera = false } = {}) {
   S.mode = 'camera';
+  D.set('mode', noCamera ? 'fallback (no camera)' : 'fallback (camera + orientation)');
   // iOS 13+: motion permission must be requested first, while we are still inside the tap.
   let motion = 'granted';
   const DOE = window.DeviceOrientationEvent;
@@ -2277,7 +2396,9 @@ async function detectSupport() {
   support.camera = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
   try {
     support.xr = !!(navigator.xr && await navigator.xr.isSessionSupported('immersive-ar'));
-  } catch (e) { support.xr = false; }
+    D.set('immersive-ar supported', navigator.xr ? support.xr : 'no navigator.xr');
+  } catch (e) { support.xr = false; D.set('immersive-ar supported', 'ERROR ' + errText(e)); }
+  D.set('iOS device', isIOS ? 'yes' : 'no');
 
   modeBadge.className = 'badge';
   if (!support.webgl) { modeBadge.classList.add('bad'); modeText.textContent = '3D graphics (WebGL) unavailable'; }
@@ -2290,6 +2411,23 @@ async function detectSupport() {
   support.ready = true;
   startBtn.disabled = false;
   renderStartButtons();
+}
+
+// The Needle App Clip fires 'sessiongranted' on navigator.xr when an AR session may start without a tap.
+// Start the same WebXR game right away (requestSession is called synchronously inside the event).
+if (navigator.xr && typeof navigator.xr.addEventListener === 'function') {
+  navigator.xr.addEventListener('sessiongranted', () => {
+    D.set('sessiongranted', 'fired');
+    if (xr.session || S.busy || !support.webgl) return;
+    support.xr = true;
+    support.ready = true;
+    S.wantAR = true;
+    D.set('mode', 'WebXR (sessiongranted)');
+    if (!S.round || S.round.finished || allCollected()) newRound();
+    buildSlots();
+    hideScreens();
+    beginSession(); // location is then checked inside AR (score bar + small location card)
+  });
 }
 
 // Keep the label / hint / toast stack just under the score bar, whatever its height.
