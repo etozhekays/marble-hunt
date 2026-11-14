@@ -188,6 +188,11 @@
   .distance { font-size: 17px; font-weight: 700; color: var(--accent); max-width: 330px; line-height: 1.35; }
   a.btn { display: inline-flex; align-items: center; justify-content: center; text-decoration: none; }
   .loc-note { margin: 0; max-width: 320px; font-size: 14px; line-height: 1.4; color: var(--muted); }
+  .reach-hint {
+    position: absolute; left: 50%; top: calc(50% + 50px); transform: translateX(-50%); white-space: nowrap;
+    padding: 6px 14px; border-radius: 999px; background: rgba(255, 185, 60, .94); color: #1d1400;
+    font-size: 14px; font-weight: 700; pointer-events: none;
+  }
   .slot.loc-start { margin-left: 8px; }   /* small gap between the locations' groups of slots */
   .slot.other { opacity: .35; }           /* marbles that belong to the other location */
   .banner {
@@ -291,6 +296,8 @@
       </svg>
     </div>
 
+    <div id="reachHint" class="reach-hint" hidden>Come closer</div>
+
     <!-- Room scanning panel (WebXR mode only) -->
     <div id="scanPanel" class="panel ui" hidden>
       <h2>Scanning your room…</h2>
@@ -308,7 +315,12 @@
       <div class="badge" id="modeBadge"><span class="dot"></span><span id="modeText">Checking your device…</span></div>
       <div class="stack">
         <button id="startBtn" class="btn" disabled>Start</button>
+        <!-- iPhone/iPad: Safari has no WebXR, so this opens the same page in the Needle Go App Clip, which has it. -->
+        <a id="appClipBtn" class="btn" hidden>Open in AR</a>
         <button id="newGameBtn" class="btn-ghost" hidden>New game</button>
+        <!-- Last resort for devices where neither AR route works. -->
+        <button id="noArBtn" class="btn-ghost" hidden>Play without AR</button>
+        <p class="loc-note" id="noArNote" hidden>Without AR, marbles can't stay fixed in the room.</p>
       </div>
       <p class="note" id="startMsg"></p>
     </section>
@@ -385,6 +397,18 @@ const MARBLE_COUNT = 10;
 /** How long (in milliseconds) the reticle has to stay on a marble to collect it. */
 const FOCUS_TIME_MS = 3000;
 
+/** Real-world marble diameter in metres in AR (0.05 = 5 cm). Never scaled: its on-screen size comes from perspective only. */
+const MARBLE_DIAMETER_M = 0.05;
+
+/** In AR, a marble can only be collected (focus or tap) from within this many metres. */
+const COLLECT_DISTANCE_M = 1.5;
+
+/**
+ * iPhone/iPad route into WebXR: this page's full URL (URL-encoded) is appended, and the page opens inside
+ * the Needle Go App Clip, where WebXR immersive-ar is available. The game itself is the same WebXR code.
+ */
+const APP_CLIP_BASE_URL = 'https://appclip.needle.tools/ar?url=';
+
 /**
  * Marble types. Each type has its own colour and inner pattern.
  * Recolour, rename, add or remove entries freely; marbles are shared out evenly between the types.
@@ -401,9 +425,17 @@ const MARBLE_TYPES = [
 
 // ----- Advanced settings ------------------------------------------------
 
-/** Marble radius in metres in full AR mode (0.02 = 4 cm across, like a big "shooter" marble). */
-const MARBLE_RADIUS_AR = 0.02;
-/** Marble radius in metres in camera (fallback) mode, where marbles float about 2 m away. */
+/** AR: a newly placed marble drops from this height (metres) onto its surface, bounces slightly and settles. */
+const DROP_HEIGHT_M = 0.05;
+/** AR: how bouncy the marble is (0 = no bounce, 1 = bounces forever). */
+const BOUNCE_RESTITUTION = 0.4;
+const GRAVITY = 9.81;
+/** AR: hide the parts of marbles behind real objects when the WebXR Depth API is available. */
+const USE_DEPTH_OCCLUSION = true;
+/** AR: marbles further than this (metres) are ignored when aiming (closer than this but beyond reach → "Come closer"). */
+const AR_AIM_DISTANCE = 15;
+
+/** Marble radius in metres in "Play without AR" mode, where marbles float about 2 m away. */
 const MARBLE_RADIUS_CAMERA = 0.045;
 
 /** Camera mode: marble distance from the player, in metres (sets how big they look). */
@@ -421,7 +453,7 @@ const FOCUS_TOLERANCE_PX = 26;
 const FOCUS_GRACE_MS = 150;
 /** Tap: a tap counts as hitting a marble within this many pixels (keeps small marbles touch-friendly). */
 const TAP_TOLERANCE_PX = 44;
-/** Marbles further than this (metres) cannot be collected; walk closer. */
+/** "Play without AR" mode: marbles further than this (metres) cannot be aimed at. */
 const MAX_COLLECT_DISTANCE = 6;
 
 /** Visual: bobbing speed and height (height as a fraction of the marble radius). */
@@ -505,6 +537,7 @@ const errorScreen = $('#errorScreen');
 const gateScreen = $('#gateScreen'), gateIcon = $('#gateIcon'), gateTitle = $('#gateTitle'), gateText = $('#gateText');
 const gateDistance = $('#gateDistance'), gateMaps = $('#gateMaps'), gatePrimary = $('#gatePrimary'), gateBack = $('#gateBack');
 const zoneLabel = $('#zoneLabel'), gpsHint = $('#gpsHint');
+const appClipBtn = $('#appClipBtn'), noArBtn = $('#noArBtn'), noArNote = $('#noArNote'), reachHint = $('#reachHint');
 
 $('#leadText').textContent = DEBUG_SKIP_LOCATION
   ? `Find the ${MARBLE_COUNT} glass marbles hidden around you. Hold the ring on one for ${FOCUS_TIME_MS / 1000} seconds, or tap it.`
@@ -646,10 +679,104 @@ if (renderer) {
   scene.environment = pmrem.fromScene(new RoomEnvironment(renderer), 0.04).texture;
   pmrem.dispose();
 }
-scene.add(new THREE.HemisphereLight(0xffffff, 0x445566, 0.7));
+// Neutral default lighting. In AR with WebXR light estimation, these are replaced by the room's real light.
+const hemi = new THREE.HemisphereLight(0xffffff, 0x445566, 0.7);
+scene.add(hemi);
 const sun = new THREE.DirectionalLight(0xffffff, 1.8);
 sun.position.set(0.6, 1, 0.4);
 scene.add(sun);
+const roomProbe = new THREE.LightProbe(); // ambient light of the real room (spherical harmonics), off by default
+roomProbe.intensity = 0;
+scene.add(roomProbe);
+
+function resetLighting() {
+  hemi.intensity = 0.7;
+  sun.color.set(0xffffff); sun.intensity = 1.8; sun.position.set(0.6, 1, 0.4);
+  roomProbe.intensity = 0;
+}
+/** Applies a WebXR light estimate: main light direction/colour plus ambient spherical harmonics. */
+function applyLightEstimate(est) {
+  if (est.sphericalHarmonicsCoefficients) {
+    roomProbe.sh.fromArray(est.sphericalHarmonicsCoefficients);
+    roomProbe.intensity = 1;
+    hemi.intensity = 0;
+  }
+  const c = est.primaryLightIntensity, d = est.primaryLightDirection;
+  if (c && d) {
+    const k = Math.max(1, c.x, c.y, c.z);
+    sun.color.setRGB(c.x / k, c.y / k, c.z / k);
+    sun.intensity = k;
+    sun.position.set(d.x, d.y, d.z);
+  }
+}
+
+// ---------- Depth occlusion (WebXR Depth API, CPU depth data) ----------
+// Every marble material gets a small fragment-shader test: if the real world (from the depth map) is
+// closer to the camera than this pixel of the marble, the pixel is discarded.
+const depthPlaceholder = new THREE.DataTexture(new Uint8Array([0, 0]), 1, 1, THREE.RGFormat);
+depthPlaceholder.needsUpdate = true;
+let depthTex = null;
+const occl = {
+  uDepthTex: { value: depthPlaceholder },
+  uDepthEnabled: { value: 0 },
+  uDepthFloat: { value: 0 },
+  uUvTransform: { value: new THREE.Matrix4() },
+  uRawToMeters: { value: 0 },
+  uViewportPx: { value: new THREE.Vector4(0, 0, 1, 1) },
+  uNearFar: { value: new THREE.Vector2(0.01, 60) },
+};
+const OCCL_GLSL = `
+uniform sampler2D uDepthTex;
+uniform float uDepthEnabled, uDepthFloat, uRawToMeters;
+uniform mat4 uUvTransform;
+uniform vec4 uViewportPx;
+uniform vec2 uNearFar;
+float mhRealDepth(vec2 viewUv) {
+  vec2 d = (uUvTransform * vec4(viewUv, 0.0, 1.0)).xy;
+  if (uDepthFloat > 0.5) return texture2D(uDepthTex, d).r * uRawToMeters;
+  vec2 p = texture2D(uDepthTex, d).rg;                   // 16-bit depth: low byte, high byte
+  return dot(p, vec2(255.0, 65280.0)) * uRawToMeters;
+}
+`;
+const OCCL_TEST = `
+  if (uDepthEnabled > 0.5) {
+    vec2 viewUv = (gl_FragCoord.xy - uViewportPx.xy) / uViewportPx.zw;
+    viewUv.y = 1.0 - viewUv.y;                            // normalized view coords have a top-left origin
+    float realD = mhRealDepth(viewUv);
+    float ndcZ = gl_FragCoord.z * 2.0 - 1.0;
+    float fragD = 2.0 * uNearFar.x * uNearFar.y / (uNearFar.y + uNearFar.x - ndcZ * (uNearFar.y - uNearFar.x));
+    if (realD > 0.0 && realD < fragD - 0.03) discard;     // a real object is in front of this pixel
+  }
+`;
+function addOcclusion(mat) {
+  mat.onBeforeCompile = (shader) => {
+    Object.assign(shader.uniforms, occl);
+    shader.fragmentShader = shader.fragmentShader.replace('void main() {', OCCL_GLSL + '\nvoid main() {\n' + OCCL_TEST);
+  };
+  mat.customProgramCacheKey = () => 'mh-occlusion';
+  return mat;
+}
+/** Uploads this frame's CPU depth map so the shaders can read it. */
+function uploadDepth(info) {
+  const w = info.width, h = info.height, isFloat = xr.depthFormat === 'float32';
+  if (!depthTex || depthTex.image.width !== w || depthTex.image.height !== h) {
+    if (depthTex) depthTex.dispose();
+    depthTex = isFloat
+      ? new THREE.DataTexture(new Float32Array(w * h), w, h, THREE.RedFormat, THREE.FloatType)
+      : new THREE.DataTexture(new Uint8Array(w * h * 2), w, h, THREE.RGFormat, THREE.UnsignedByteType); // RG8 (WebGL2)
+    depthTex.magFilter = depthTex.minFilter = THREE.NearestFilter; // packed bytes must not be blended
+    depthTex.generateMipmaps = false;
+    depthTex.unpackAlignment = 1;
+    occl.uDepthTex.value = depthTex;
+    occl.uDepthFloat.value = isFloat ? 1 : 0;
+  }
+  const src = isFloat ? new Float32Array(info.data) : new Uint8Array(info.data);
+  depthTex.image.data.set(src.subarray(0, depthTex.image.data.length));
+  depthTex.needsUpdate = true;
+  occl.uUvTransform.value.fromArray(info.normDepthBufferFromNormView.matrix);
+  occl.uRawToMeters.value = info.rawValueToMeters;
+  occl.uDepthEnabled.value = 1;
+}
 
 /** Makes a small radial-gradient texture on a canvas (used for halo, shadow and glint). */
 function canvasTexture(draw) {
@@ -720,9 +847,10 @@ function typeResources(typeIdx, r) {
     coreMat: new THREE.MeshStandardMaterial({
       color: t.color, emissive: t.color, emissiveIntensity: 0.55, roughness: 0.3, metalness: 0.1, flatShading: flat,
     }),
-    glintMat: new THREE.SpriteMaterial({ map: glintTex, transparent: true, depthTest: false, depthWrite: false }),
-    shadowGeo: new THREE.PlaneGeometry(r * 3.2, r * 3.2).rotateX(-Math.PI / 2),
+    glintMat: new THREE.SpriteMaterial({ map: glintTex, transparent: true, depthWrite: false }),
+    shadowGeo: new THREE.PlaneGeometry(r * 2.6, r * 2.6).rotateX(-Math.PI / 2),
   };
+  addOcclusion(res.shellMat); addOcclusion(res.coreMat); addOcclusion(res.glintMat);
   typeCache.set(key, res);
   return res;
 }
@@ -744,24 +872,27 @@ function createMarble(slot, typeIdx, r, withShadow) {
   const glint = new THREE.Sprite(res.glintMat);
   glint.scale.setScalar(r * 2.02);
   glint.renderOrder = 3;
-  const halo = new THREE.Sprite(new THREE.SpriteMaterial({
+  const halo = new THREE.Sprite(addOcclusion(new THREE.SpriteMaterial({
     map: haloTex, color: MARBLE_TYPES[typeIdx].color, transparent: true, depthWrite: false, opacity: GLOW_MIN,
-  }));
+  })));
   halo.scale.setScalar(r * HALO_SIZE);
   halo.renderOrder = 1;
   body.add(core, shell, glint, halo);
 
   let shadow = null;
   if (withShadow) {
-    shadow = new THREE.Mesh(res.shadowGeo, new THREE.MeshBasicMaterial({ map: shadowTex, transparent: true, depthWrite: false, opacity: 0.45 }));
+    // Soft contact shadow on the surface the marble rests on.
+    shadow = new THREE.Mesh(res.shadowGeo, addOcclusion(new THREE.MeshBasicMaterial({ map: shadowTex, transparent: true, depthWrite: false, opacity: 0.55 })));
     shadow.position.y = 0.002;
     root.add(shadow);
   }
   return {
-    slot, type: typeIdx, radius: r, root, body, core, halo, shadow,
+    slot, type: typeIdx, radius: r, root, body, core, halo, glint, shadow,
     restY: withShadow ? r : 0,       // resting height of the centre above the surface
     phase: Math.random() * Math.PI * 2,
     anchor: null, collected: false,
+    // AR marbles are physical: they sit on a real surface and fall with gravity (h = height of the bottom above it).
+    physics: withShadow, h: 0, vy: 0, dropDelay: 0, settled: true,
   };
 }
 function removeMarble(m) {
@@ -841,18 +972,36 @@ function projectToScreen(world, out) {
 function radiusPx(r, depth) {
   return (r / depth) * camera.projectionMatrix.elements[5] * viewH() / 2;
 }
-/** Finds the closest uncollected marble to a screen point, within tolerance. */
+/** Finds the closest uncollected marble to a screen point, within tolerance. Returns { m, dist } (metres) or null. */
 function pickMarbleAt(x, y, minTolPx, sizeFactor) {
-  let best = null, bestD = Infinity;
+  const maxAim = S.mode === 'xr' ? AR_AIM_DISTANCE : MAX_COLLECT_DISTANCE;
+  let best = null, bestD = Infinity, bestDist = 0;
   for (const m of S.marbles) {
     if (m.collected) continue;
-    const p = projectToScreen(marbleWorldPos(m, _w), _scr);
-    if (!p || p.depth > MAX_COLLECT_DISTANCE) continue;
+    marbleWorldPos(m, _w);
+    const dist = _w.distanceTo(camera.position);
+    const p = projectToScreen(_w, _scr);
+    if (!p || dist > maxAim) continue;
     const d = Math.hypot(p.x - x, p.y - y);
     const tol = Math.max(minTolPx, radiusPx(m.radius, p.depth) * sizeFactor);
-    if (d <= tol && d < bestD) { best = m; bestD = d; }
+    if (d <= tol && d < bestD) { best = m; bestD = d; bestDist = dist; }
   }
-  return best;
+  return best ? { m: best, dist: bestDist } : null;
+}
+/** AR is in reach-limited mode: marbles must be within COLLECT_DISTANCE_M. */
+const tooFarAway = (hit) => !!hit && S.mode === 'xr' && hit.dist > COLLECT_DISTANCE_M;
+
+/** "Come closer" hint under the reticle; flash=true keeps it up for a moment (after a tap). */
+let reachFlashUntil = 0;
+function setReachHint(dist, flash = false) {
+  const now = performance.now();
+  if (flash) reachFlashUntil = now + 1500;
+  if (dist != null) {
+    reachHint.textContent = `Come closer · ${dist.toFixed(1)} m`;
+    reachHint.hidden = false;
+  } else if (now > reachFlashUntil) {
+    reachHint.hidden = true;
+  }
 }
 
 // =====================================================================
@@ -870,7 +1019,10 @@ function setRing(progress, locked) {
 
 /** Focus collection: called every frame; the reticle must stay on the same marble for FOCUS_TIME_MS. */
 function updateFocus(dtMs) {
-  const target = pickMarbleAt(viewW() / 2, viewH() / 2, FOCUS_TOLERANCE_PX, 1.15);
+  const hit = pickMarbleAt(viewW() / 2, viewH() / 2, FOCUS_TOLERANCE_PX, 1.15);
+  const far = tooFarAway(hit);                   // aiming at a marble that is out of reach: no progress
+  setReachHint(far ? hit.dist : null);
+  const target = hit && !far ? hit.m : null;
   const F = S.focus;
   if (target && target === F.marble) {
     F.ms += dtMs; F.lostMs = 0;
@@ -887,8 +1039,10 @@ function updateFocus(dtMs) {
 
 function handleTap(x, y) {
   if (S.phase !== 'playing') return;
-  const m = pickMarbleAt(x, y, TAP_TOLERANCE_PX, 1.4);
-  if (m) collect(m);
+  const hit = pickMarbleAt(x, y, TAP_TOLERANCE_PX, 1.4);
+  if (!hit) return;
+  if (tooFarAway(hit)) { setReachHint(hit.dist, true); vibrate(20); return; }
+  collect(hit.m);
 }
 
 function collect(m) {
@@ -1016,9 +1170,29 @@ function showStart(msg = '') {
   zoneLabel.hidden = gpsHint.hidden = true;
   startScreen.hidden = false;
   startMsg.textContent = msg;
+  renderStartButtons();
+}
+
+/** The App Clip link for this exact page (full HTTPS URL, URL-encoded). */
+const appClipUrl = () => APP_CLIP_BASE_URL + encodeURIComponent(location.href);
+
+/**
+ * Start buttons for each route into the game:
+ *  - WebXR available (Android Chrome, or inside the App Clip): Start → AR
+ *  - iPhone/iPad Safari: "Open in AR" → App Clip
+ *  - neither: only "Play without AR" (camera + motion sensors)
+ */
+function renderStartButtons() {
   const saved = S.round && !S.round.finished && !allCollected() && (collectedCount() > 0 || S.round.elapsedMs > 1000);
-  startBtn.textContent = saved ? `Continue · ${collectedCount()} / ${MARBLE_COUNT}` : 'Start';
-  newGameBtn.hidden = !saved;
+  const progress = saved ? ` · ${collectedCount()} / ${MARBLE_COUNT}` : '';
+  const noXR = support.ready && !support.xr;
+  startBtn.hidden = noXR;
+  startBtn.textContent = saved ? `Continue${progress}` : 'Start';
+  appClipBtn.hidden = !(noXR && isIOS);
+  appClipBtn.href = appClipUrl();
+  newGameBtn.hidden = !saved || noXR;
+  noArBtn.hidden = noArNote.hidden = !noXR;
+  noArBtn.textContent = `Play without AR${progress}`;
 }
 
 function showWin() {
@@ -1040,7 +1214,9 @@ const ERRORS = {
   'camera-denied': ['📷', 'Camera access blocked',
     'Marble Hunt needs your camera to show your room. Allow camera access for this site in your browser settings (tap the icon next to the address bar, then Camera → Allow), then tap Try again.'],
   'xr-denied': ['🕶️', 'AR permission declined',
-    'The AR session needs permission to use your camera. Tap Try again and accept the prompt, or play in simple camera mode.'],
+    "The AR session needs permission to use your camera. Tap Try again and accept the prompt, or play without AR (marbles can't stay fixed in the room then)."],
+  'xr-failed': ['🕶️', "AR couldn't start",
+    'On Android, make sure "Google Play Services for AR" is installed and up to date, then tap Try again. You can also play without AR, but marbles can\'t stay fixed in the room then.'],
   'motion-denied': ['🧭', 'Motion access blocked',
     'Motion sensors let you look around by moving your phone. You can still play by dragging the screen.'],
   'no-camera': ['📷', 'No camera found', 'We could not find a camera on this device.'],
@@ -1070,7 +1246,7 @@ function showError(kind, err) {
   $('#errRetry').hidden = !canRetry;
   // "Play without camera" lets people still enjoy the game (marbles float in a virtual room).
   $('#errAlt').hidden = ['insecure', 'webgl', 'no-geo'].includes(kind);
-  $('#errAlt').textContent = kind === 'xr-denied' ? 'Use simple camera mode' : 'Play without camera';
+  $('#errAlt').textContent = kind === 'xr-denied' || kind === 'xr-failed' ? 'Play without AR' : 'Play without camera';
   $('#errAlt').dataset.kind = kind;
   errorScreen.hidden = false;
 }
@@ -1078,12 +1254,13 @@ function showError(kind, err) {
 // =====================================================================
 //  Starting a game
 // =====================================================================
-function startGame(fresh) {
+function startGame(fresh, { fallback = false } = {}) {
   if (S.busy || !support.ready) return;
   ensureAudio(); // must happen inside the tap so iOS unlocks sound
   if (!support.webgl) return showError('webgl');
   if (!support.secure) return showError('insecure');
-  if (!support.xr && !support.camera) return showError('unsupported');
+  S.wantAR = support.xr && !fallback; // WebXR, unless the player chose "Play without AR"
+  if (!S.wantAR && !support.camera) return showError('unsupported');
   if (!DEBUG_SKIP_LOCATION && !('geolocation' in navigator)) return showError('no-geo');
 
   if (fresh || !S.round || S.round.finished || allCollected()) newRound();
@@ -1091,7 +1268,9 @@ function startGame(fresh) {
   hideScreens();
 
   // Location already allowed (or check switched off): open the camera / AR straight from this tap.
-  if (DEBUG_SKIP_LOCATION || geo.perm === 'granted') { beginSession(); return; }
+  // (AR without a DOM overlay can't show the location screen inside AR, so it checks the zone first.)
+  const checkZoneFirst = S.wantAR && support.xrOverlay === false;
+  if (DEBUG_SKIP_LOCATION || (geo.perm === 'granted' && !checkZoneFirst)) { beginSession(); return; }
 
   // Otherwise ask for location first. AR and the iPhone motion prompt must be started from a tap, and the
   // location prompt would use that tap up, so once location is allowed the player taps once more.
@@ -1108,7 +1287,7 @@ function beginSession() {
   hideGate();
   // NOTE: requestSession / requestPermission are the first calls in these functions, so they still
   // run inside the tap ("user activation"), which browsers require.
-  const p = support.xr ? startXR().catch(onXRStartFailed) : startCameraMode();
+  const p = S.wantAR ? startXR().catch(onXRStartFailed) : startCameraMode();
   startGeoWatch(); // no-op if already watching
   p.finally(() => { S.busy = false; });
 }
@@ -1206,12 +1385,12 @@ function onGeoPosition(pos) {
   else if (++geo.outsideCount >= EXIT_CONFIRM_READINGS) next = -1;
 
   updateGpsHint();
-  if (S.phase === 'locating') geoGranted();
   if (next !== geo.zone) {
     geo.zone = next;
     geo.outsideCount = 0;
     if (S.mode && S.phase !== 'starting') refreshZoneGameplay('zone');
   }
+  if (S.phase === 'locating') geoGranted();
   updateGateDistance();
   updateZoneLabel();
 }
@@ -1235,7 +1414,12 @@ function onGeoError(err) {
 /** Location was allowed while the player waited on the "Allow location" screen. */
 function geoGranted() {
   if (S.phase !== 'locating') return;
-  const needsTap = support.xr || (window.DeviceOrientationEvent && typeof DeviceOrientationEvent.requestPermission === 'function');
+  // AR without a DOM overlay can't show the location screen, so only offer "Start AR" once at a marble spot.
+  if (S.wantAR && support.xrOverlay === false && !DEBUG_SKIP_LOCATION) {
+    if (geo.zone === null) { if (gate.variant !== 'finding') showGate('finding'); return; }
+    if (geo.zone === -1) { if (gate.variant !== 'outside') showGate('outside'); return; }
+  }
+  const needsTap = S.wantAR || (window.DeviceOrientationEvent && typeof DeviceOrientationEvent.requestPermission === 'function');
   if (needsTap) { if (gate.variant !== 'ready') showGate('ready'); }
   else beginSession(); // e.g. Android camera mode: nothing else needs a tap
 }
@@ -1275,7 +1459,7 @@ function showGate(variant) {
     asking: ['📍', 'Allow location access',
       `Marbles only appear at ${LOCATIONS.length} spots in ${AREA_NAME}, so the game needs your location to check where you are. It is only used on your phone.`],
     ready: ['✅', 'Location is on',
-      support.xr ? 'Tap below to start AR and look for marbles.' : 'Tap below to open the camera and look for marbles.'],
+      S.wantAR ? 'Tap below to start AR and look for marbles.' : 'Tap below to open the camera and look for marbles.'],
     finding: ['', 'Finding your location…', 'This can take a few seconds. Being outdoors under open sky helps.'],
     outside: ['🗺️', `You need to be at ${placeList()} in ${AREA_NAME} to find marbles.`,
       'Your progress is saved. The marbles appear as soon as you arrive.'],
@@ -1294,7 +1478,7 @@ function showGate(variant) {
   if (variant === 'ready') gate.action = () => beginSession();
   if (variant === 'denied' || variant === 'unavailable') gate.action = restartGeoWatch;
   gatePrimary.hidden = !gate.action;
-  gatePrimary.textContent = variant === 'ready' ? (support.xr ? 'Start AR' : 'Open camera') : 'Try again';
+  gatePrimary.textContent = variant === 'ready' ? (S.wantAR ? 'Start AR' : 'Open camera') : 'Try again';
   gateBack.textContent = inSession ? 'Exit to menu' : 'Back';
 
   gateDistance.hidden = gateMaps.hidden = variant !== 'outside';
@@ -1333,7 +1517,7 @@ function refreshZoneGameplay(reason = 'zone') {
     // Surfaces scanned at another place are useless here: start a fresh scan for this location.
     xr.candidates.clear();
     scanGeo.setDrawRange(0, 0);
-    xr.placed.clear();
+    xr.placed.clear(); xr.dropped.clear();
     xr.candZone = zone;
   }
   const need = remainingSlots().length;
@@ -1360,6 +1544,14 @@ function refreshZoneGameplay(reason = 'zone') {
 
 /** Hides the marbles and shows the gate (outside a zone, waiting for GPS, or a location problem). */
 function goAway(variant) {
+  // AR without a DOM overlay can't show this screen: close AR and show it in the page instead.
+  // (While the first GPS fix is still coming, just wait inside AR; the zone check follows within seconds.)
+  if (S.mode === 'xr' && xr.session && !xr.hasOverlay && variant !== 'finding') {
+    xr.endToGate = variant;
+    clearMarbles();
+    xr.session.end();
+    return;
+  }
   if (S.phase !== 'away') clearToasts();
   clearMarbles();
   xr.pendingPlacement = false;
@@ -1402,9 +1594,8 @@ function onXRStartFailed(err) {
   stopGameLoop();
   renderer.xr.enabled = false;
   if (err && (err.name === 'NotAllowedError' || err.name === 'SecurityError')) return showError('xr-denied', err);
-  // Anything else (missing feature, ARCore not installed…): fall back to camera mode.
-  toast('Full AR could not start, using camera mode instead.');
-  return startCameraMode();
+  // Anything else (ARCore missing, App Clip closed…): explain, and offer "Play without AR" as a last resort.
+  return showError('xr-failed', err);
 }
 
 // The game loop runs only while a game is active (saves battery on menus).
@@ -1419,13 +1610,19 @@ function loop(timeMs, frame) {
 
   if (S.mode === 'xr' && frame) {
     xrFrame(frame);
-    if (renderer.xr.isPresenting) renderer.xr.updateCamera(camera); // camera now holds this frame's XR pose
+    if (renderer.xr.isPresenting) {
+      renderer.xr.updateCamera(camera); // camera now holds this frame's XR pose
+      const views = renderer.xr.getCamera().cameras;
+      if (views.length) occl.uViewportPx.value.copy(views[0].viewport);
+      occl.uNearFar.value.set(camera.near, camera.far);
+    }
   } else if (S.mode === 'camera') {
     updateSensorCamera(dtMs);
   }
 
   animateMarbles(now / 1000, dtMs / 1000);
   if (S.phase === 'playing') updateFocus(dtMs);
+  else if (!reachHint.hidden) reachHint.hidden = true;
   updateTimer(dtMs);
 
   if (reticle3D.visible) { // keep the fallback 3D reticle 0.5 m in front of the eyes
@@ -1435,21 +1632,49 @@ function loop(timeMs, frame) {
   renderer.render(scene, camera);
 }
 
-/** Bobbing, spinning cores, pulsing glow. */
+const _g = new THREE.Vector3();
+/**
+ * AR marbles behave like objects: they fall onto their surface, bounce, settle and then stay still
+ * (nothing is scaled or moved after that). "Play without AR" marbles bob and spin to be easier to spot.
+ * The glow pulses in both modes.
+ */
 function animateMarbles(t, dt) {
   for (const m of S.marbles) {
-    const s = Math.sin(t * BOB_SPEED + m.phase) * 0.5 + 0.5;
-    m.body.position.y = m.restY + s * m.radius * BOB_HEIGHT;
-    m.core.rotation.y += dt * 0.9;
-    m.core.rotation.z += dt * 0.35;
     const focused = S.focus.marble === m;
     const pulse = Math.sin(t * 2.6 + m.phase * 1.3) * 0.5 + 0.5;
     m.halo.material.opacity = GLOW_MIN + (GLOW_MAX - GLOW_MIN) * pulse + (focused ? 0.3 : 0);
-    const hs = m.radius * HALO_SIZE * (focused ? 1.1 + 0.4 * (S.focus.ms / FOCUS_TIME_MS) : 1);
-    m.halo.scale.set(hs, hs, 1);
-    if (m.shadow) {
-      m.shadow.material.opacity = 0.5 - s * 0.25;
-      m.shadow.scale.setScalar(1 - s * 0.2);
+    if (m.physics) {
+      stepDrop(m, dt);
+      m.body.position.y = m.radius + m.h;     // resting on the surface once h reaches 0
+      const k = clamp(m.h / 0.08, 0, 1);      // the shadow fades and spreads while the marble is in the air
+      m.shadow.material.opacity = 0.55 * (1 - 0.6 * k);
+      m.shadow.scale.setScalar(1 + 0.6 * k);
+    } else {
+      const s = Math.sin(t * BOB_SPEED + m.phase) * 0.5 + 0.5;
+      m.body.position.y = m.restY + s * m.radius * BOB_HEIGHT;
+      m.core.rotation.y += dt * 0.9;
+      m.core.rotation.z += dt * 0.35;
+      const hs = m.radius * HALO_SIZE * (focused ? 1.1 + 0.4 * (S.focus.ms / FOCUS_TIME_MS) : 1);
+      m.halo.scale.set(hs, hs, 1);
+    }
+    // The camera-facing highlight sits just inside the front of the glass, so it depth-tests correctly.
+    _g.copy(camera.position).sub(marbleWorldPos(m, _w));
+    const len = _g.length();
+    if (len > 1e-4) m.glint.position.copy(_g.multiplyScalar((m.radius * 0.9) / len));
+  }
+}
+/** Gravity + bounce for a freshly placed AR marble (small sub-steps keep the bounce stable). */
+function stepDrop(m, dt) {
+  if (m.settled) return;
+  if (m.dropDelay > 0) { m.dropDelay -= dt; return; }
+  const n = 4, h = dt / n;
+  for (let i = 0; i < n && !m.settled; i++) {
+    m.vy -= GRAVITY * h;
+    m.h += m.vy * h;
+    if (m.h <= 0) {
+      m.h = 0;
+      if (Math.abs(m.vy) < 0.25) { m.vy = 0; m.settled = true; }
+      else m.vy = -m.vy * BOUNCE_RESTITUTION;
     }
   }
 }
@@ -1491,12 +1716,12 @@ function playAgain() {
   buildSlots();
   winScreen.hidden = true;
   clearMarbles();
-  xr.placed.clear();      // new marbles get new spots (scanned surfaces are kept)
+  xr.placed.clear(); xr.dropped.clear();      // new marbles get new spots (scanned surfaces are kept)
   if (S.mode && (S.mode === 'camera' || xr.session)) {
     S.phase = 'playing';  // leave the 'won' state so the refresh below runs
     refreshZoneGameplay('again');
   } else {
-    startGame(false);
+    startGame(false, { fallback: !S.wantAR });
   }
 }
 
@@ -1508,20 +1733,42 @@ const xr = {
   candidates: new Map(),        // surface spots found while scanning (key = grid cell)
   candZone: undefined,          // which location the scanned spots belong to
   placed: new Map(),            // slot index → spot, so a marble keeps its spot when you leave and come back
+  dropped: new Set(),           // slots whose marble already did its spawn drop this session
+  features: null,               // Set of enabled optional features (null if the browser doesn't say)
+  anchors: false, depth: false, depthFormat: '', lightProbe: null,
+  endToGate: null,              // no DOM overlay: leave AR to show this gate screen in the page
   viewer: new THREE.Vector3(),
   frameCount: 0, scanStart: 0, pendingPlacement: false, lostSince: 0,
 };
 // Several hit-test rays fan out from the screen (biased downwards) so scanning finds surfaces faster.
 const HIT_RAYS = [[0, 0], [0.2, 0.08], [-0.2, 0.08], [0.2, -0.25], [-0.2, -0.25], [0, -0.45]];
 
+/** Was an optional WebXR feature granted? (If the browser doesn't report it, the API checks at each use decide.) */
+const xrHas = (f) => (xr.features ? xr.features.has(f) : true);
+
+/**
+ * The one AR code path for every platform: Android Chrome (ARCore) starts it from the Start button,
+ * iPhone/iPad reach it inside the Needle Go App Clip. Only hit-test is required; everything else is optional.
+ */
 async function startXR() {
   // First call: must stay inside the user's tap.
-  const session = await navigator.xr.requestSession('immersive-ar', {
-    requiredFeatures: ['hit-test'],
-    optionalFeatures: ['dom-overlay', 'plane-detection', 'anchors'],
-    domOverlay: { root: overlayEl },
-  });
+  let session;
+  try {
+    session = await navigator.xr.requestSession('immersive-ar', {
+      requiredFeatures: ['hit-test'],
+      optionalFeatures: ['dom-overlay', 'anchors', 'plane-detection', 'depth-sensing', 'light-estimation'],
+      domOverlay: { root: overlayEl },
+      depthSensing: { usagePreference: ['cpu-optimized'], dataFormatPreference: ['luminance-alpha', 'float32'] },
+    });
+  } catch (e) {
+    if (e && (e.name === 'NotAllowedError' || e.name === 'SecurityError')) throw e;
+    // Some WebXR implementations reject optional features they don't know: retry with the bare minimum.
+    session = await navigator.xr.requestSession('immersive-ar', {
+      requiredFeatures: ['hit-test'], optionalFeatures: ['dom-overlay'], domOverlay: { root: overlayEl },
+    });
+  }
   xr.session = session;
+  xr.features = session.enabledFeatures ? new Set(session.enabledFeatures) : null;
   S.mode = 'xr';
   stopCamera();
   gridSphere.visible = false;
@@ -1544,17 +1791,32 @@ async function startXR() {
   if (!xr.hitSources.length) throw new Error('No hit-test source available');
 
   xr.hasOverlay = !!session.domOverlayState;
+  support.xrOverlay = xr.hasOverlay;
+
+  // Optional features, each checked before use.
+  xr.anchors = xrHas('anchors') && typeof XRFrame !== 'undefined' && 'createAnchor' in XRFrame.prototype;
+  xr.depth = false;
+  if (USE_DEPTH_OCCLUSION && renderer.capabilities.isWebGL2 && xrHas('depth-sensing')) {
+    try { xr.depth = session.depthUsage === 'cpu-optimized'; xr.depthFormat = session.depthDataFormat; }
+    catch (e) { xr.depth = false; } // the getters throw when depth sensing was not granted
+  }
+  xr.lightProbe = null;
+  if (xrHas('light-estimation') && typeof session.requestLightProbe === 'function') {
+    try { xr.lightProbe = await session.requestLightProbe(); } catch (e) { xr.lightProbe = null; }
+  }
+
   session.addEventListener('select', onXRSelect);
   session.addEventListener('end', onXREnd);
 
   clearMarbles();
   xr.candidates.clear();
   scanGeo.setDrawRange(0, 0);
-  xr.placed.clear();
+  xr.placed.clear(); xr.dropped.clear();
   xr.candZone = undefined;
   xr.frameCount = 0;
   startGameLoop();
-  toast('Full AR mode: marbles will hide on your real floor and furniture.', 3500);
+  const extras = [xr.anchors && 'anchors', xr.depth && 'occlusion', xr.lightProbe && 'room lighting'].filter(Boolean);
+  toast('Full AR: marbles stay put on your real floor and furniture.' + (extras.length ? ` Using ${extras.join(', ')}.` : ''), 3500);
   refreshZoneGameplay('start'); // scan and hide marbles if at a marble spot, otherwise show the location screen
 }
 
@@ -1594,6 +1856,15 @@ function xrFrame(frame) {
   trackingEl.hidden = true;
   const p = pose.transform.position;
   xr.viewer.set(p.x, p.y, p.z);
+
+  if (xr.lightProbe) {
+    try { const est = frame.getLightEstimate(xr.lightProbe); if (est) applyLightEstimate(est); } catch (e) { /* not ready */ }
+  }
+  if (xr.depth) {
+    let info = null;
+    try { info = frame.getDepthInformation(pose.views[0]); } catch (e) { /* depth not ready yet */ }
+    if (info && info.data) uploadDepth(info); else occl.uDepthEnabled.value = 0;
+  }
 
   const scanning = S.phase === 'scanning';
   // Keep collecting surface spots while playing too (less often) so "Play again" has a fresh map,
@@ -1650,6 +1921,7 @@ function collectHitSpots(frame, scanning) {
 
 /** Plane detection (if available) adds random spots across each detected floor / table / shelf. */
 function collectPlaneSpots(frame) {
+  if (!xrHas('plane-detection')) return;
   let planes;
   try { planes = frame.detectedPlanes; } catch (e) { return; }
   if (!planes) return;
@@ -1732,12 +2004,17 @@ function placeMarblesXR(frame) {
   });
   slots.forEach((slotIdx) => {
     const base = xr.placed.get(slotIdx).clone();
-    const m = createMarble(slotIdx, S.round.slots[slotIdx].type, MARBLE_RADIUS_AR, true);
-    m.root.position.copy(base);
+    const m = createMarble(slotIdx, S.round.slots[slotIdx].type, MARBLE_DIAMETER_M / 2, true);
+    m.root.position.copy(base);  // the surface point from hit-testing; fixed in world space
+    if (!xr.dropped.has(slotIdx)) { // first appearance this session: drop onto the surface
+      m.h = DROP_HEIGHT_M; m.settled = false; m.dropDelay = rand(0, 0.35);
+      xr.dropped.add(slotIdx);
+    }
     world.add(m.root);
     S.marbles.push(m);
-    // Anchor each marble to the real world when the device supports anchors.
-    if (frame.createAnchor && window.XRRigidTransform) {
+    // Anchor each marble to the real world when the device supports anchors; otherwise it simply stays
+    // at its world-space position in the 'local' reference space.
+    if (xr.anchors && frame.createAnchor && window.XRRigidTransform) {
       try {
         frame.createAnchor(new XRRigidTransform({ x: base.x, y: base.y, z: base.z, w: 1 }), xr.refSpace)
           .then((anchor) => { if (m.collected || !S.marbles.includes(m)) anchor.delete(); else m.anchor = anchor; })
@@ -1760,20 +2037,32 @@ function onXRSelect(e) {
 }
 
 function onXREnd() {
+  const toGate = xr.endToGate;  // set when AR without DOM overlay had to close to show the location screen
+  xr.endToGate = null;
   xr.hitSources.forEach((s) => { try { s.cancel(); } catch (e) { /* ignore */ } });
   xr.hitSources = [];
   xr.session = null;
   xr.pendingPlacement = false;
   clearMarbles();
   stopGameLoop();
-  stopGeoWatch();
+  if (!toGate) stopGeoWatch();
   hideGate();
+  resetLighting();
+  occl.uDepthEnabled.value = 0;
+  xr.lightProbe = null; xr.depth = false;
   renderer.xr.enabled = false;
   scanPoints.visible = surfaceRing.visible = reticle3D.visible = false;
   S.mode = null;
   saveRound();
   onResize();
   if (S.phase === 'won') { hud.hidden = true; showWin(); }
+  else if (toGate && S.phase !== 'error') {
+    // Wait on the location screen in the page; "Start AR" appears once the player is at a marble spot.
+    S.phase = 'locating';
+    hud.hidden = false;
+    showGate(toGate);
+    if (geo.status === 'ok') geoGranted();
+  }
   else if (S.phase !== 'error') { S.phase = 'start'; showStart('AR session ended. Your progress is saved.'); }
 }
 
@@ -1928,17 +2217,20 @@ canvas.addEventListener('pointercancel', () => { ptr = null; });
 // =====================================================================
 startBtn.addEventListener('click', () => startGame(false));
 newGameBtn.addEventListener('click', () => startGame(true));
+noArBtn.addEventListener('click', () => startGame(false, { fallback: true }));
 againBtn.addEventListener('click', playAgain);
 
-$('#errRetry').addEventListener('click', () => startGame(false));
+$('#errRetry').addEventListener('click', () => startGame(false, { fallback: !S.wantAR }));
 $('#errBack').addEventListener('click', goHome);
 $('#errAlt').addEventListener('click', () => {
   ensureAudio();
   hideScreens();
   buildSlots();
-  // From an XR refusal, "simple camera mode" still tries the camera; otherwise play without it.
+  // From an AR problem, "Play without AR" still uses the camera; from a camera problem, play without it.
+  const kind = $('#errAlt').dataset.kind;
+  S.wantAR = false;
   S.phase = 'starting';
-  startCameraMode({ noCamera: $('#errAlt').dataset.kind !== 'xr-denied' });
+  startCameraMode({ noCamera: kind !== 'xr-denied' && kind !== 'xr-failed' });
   startGeoWatch(); // after startCameraMode, whose iPhone motion prompt must come first in the tap
 });
 gatePrimary.addEventListener('click', () => { ensureAudio(); if (gate.action) gate.action(); });
@@ -1990,12 +2282,14 @@ async function detectSupport() {
   modeBadge.className = 'badge';
   if (!support.webgl) { modeBadge.classList.add('bad'); modeText.textContent = '3D graphics (WebGL) unavailable'; }
   else if (!support.secure) { modeBadge.classList.add('bad'); modeText.textContent = 'Needs HTTPS to use the camera'; }
-  else if (support.xr) { modeBadge.classList.add('xr'); modeText.textContent = 'Full AR: marbles hide on your real surfaces'; }
-  else if (support.camera) { modeBadge.classList.add('cam'); modeText.textContent = 'Camera mode: turn and tilt your phone to search'; }
-  else { modeBadge.classList.add('bad'); modeText.textContent = 'Camera not available in this browser'; }
+  else if (support.xr && isIOS) { modeBadge.classList.add('xr'); modeText.textContent = 'Full AR (App Clip): marbles stay put on your real surfaces'; }
+  else if (support.xr) { modeBadge.classList.add('xr'); modeText.textContent = 'Full AR: marbles stay put on your real surfaces'; }
+  else if (isIOS) { modeBadge.classList.add('cam'); modeText.textContent = 'On iPhone, AR opens in the Needle Go App Clip'; }
+  else { modeBadge.classList.add('bad'); modeText.textContent = 'Full AR is not available in this browser'; }
 
   support.ready = true;
   startBtn.disabled = false;
+  renderStartButtons();
 }
 
 // Keep the label / hint / toast stack just under the score bar, whatever its height.
