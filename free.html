@@ -1,0 +1,2185 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, minimum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#0b0d17">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Marble Hunt — Free Play</title>
+
+<!--
+  Debug panel: open the page with ?debug=1 to see WebXR support, the chosen mode, the session result,
+  enabled features and any uncaught errors on screen (useful inside the App Clip, which has no console).
+  This plain script runs before the game module, so it also catches errors that stop the module loading.
+-->
+<script>
+(function () {
+  var on = /[?&]debug=1(&|$)/.test(location.search);
+  var state = {}, order = [], lines = [];
+  function render() {
+    if (!on) return;
+    var el = document.getElementById('debugPanel');
+    if (!el) return;
+    el.hidden = false;
+    var out = order.map(function (k) { return k + ': ' + state[k]; }).join('\n');
+    // newest log lines first, so they are never cut off at the bottom of the panel
+    el.textContent = out + (lines.length ? '\n--- log (newest first) ---\n' + lines.slice().reverse().join('\n') : '');
+  }
+  window.MHDebug = {
+    on: on,
+    set: function (k, v) { if (!(k in state)) order.push(k); state[k] = String(v); render(); },
+    log: function (msg) {
+      lines.push(new Date().toTimeString().slice(0, 8) + ' ' + msg);
+      if (lines.length > 25) lines.shift();
+      render();
+    },
+  };
+  if (!on) return;
+  MHDebug.set('navigator.xr', navigator.xr ? 'exists' : 'MISSING');
+  MHDebug.set('immersive-ar supported', 'checking...');
+  MHDebug.set('mode', '(not started)');
+  MHDebug.set('requestSession', '(not called yet)');
+  MHDebug.set('enabled features', '-');
+  MHDebug.set('sessiongranted', 'not fired');
+  MHDebug.set('user agent', navigator.userAgent);
+  addEventListener('error', function (e) {
+    var t = e.target;
+    if (t && t !== window && (t.src || t.href)) MHDebug.log('LOAD ERROR: ' + (t.src || t.href));
+    else MHDebug.log('ERROR: ' + (e.message || e) + (e.filename ? ' @ ' + e.filename.split('/').pop() + ':' + e.lineno : ''));
+  }, true);
+  addEventListener('unhandledrejection', function (e) {
+    var r = e.reason;
+    MHDebug.log('UNHANDLED REJECTION: ' + (r && r.name ? r.name + ': ' : '') + (r && r.message ? r.message : r));
+  });
+  document.addEventListener('DOMContentLoaded', render);
+})();
+</script>
+
+<!-- Three.js from a CDN via an import map (no build step). -->
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<style>
+  :root {
+    --bg: #0b0d17;
+    --panel: rgba(13, 16, 30, 0.78);
+    --text: #f4f6ff;
+    --muted: #a9b0d4;
+    --accent: #7cf0ff;
+    --accent-2: #b28dff;
+    --danger: #ff6b7d;
+    --safe-top: env(safe-area-inset-top, 0px);
+    --safe-bottom: env(safe-area-inset-bottom, 0px);
+
+    /* Reset (↻) button position. Fine-tune here, e.g. to stay clear of the Needle App Clip's own button.
+       --reset-right is the gap to the right screen edge, added on top of the safe-area inset. */
+    --reset-right: 4px;
+    --reset-top: 0px;      /* nudge down (+) or up (-) from the score bar's first row */
+    --reset-size: 34px;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  [hidden] { display: none !important; }
+  #overlay:xr-overlay { background: transparent !important; }
+
+  /* Lock the page: no scrolling, no zooming, no text selection. */
+  html, body {
+    margin: 0; width: 100%; height: 100%; overflow: hidden;
+    background: var(--bg); color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+    overscroll-behavior: none; touch-action: none;
+    -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
+    -webkit-text-size-adjust: 100%;
+  }
+  body { position: fixed; inset: 0; }
+
+  /* Layer 0: live camera (fallback mode). Layer 1: 3D canvas. Layer 2: UI. */
+  #camera {
+    position: fixed; inset: 0; width: 100%; height: 100%;
+    object-fit: cover; z-index: 0; background: #000; display: none;
+  }
+  #scene { position: fixed; inset: 0; width: 100%; height: 100%; z-index: 1; display: block; touch-action: none; }
+  #overlay { position: fixed; inset: 0; z-index: 2; pointer-events: none; overflow: hidden; }
+  .ui, .ui * { pointer-events: auto; }
+  button { font: inherit; color: inherit; touch-action: manipulation; cursor: pointer; }
+
+  /* ---------- Buttons ---------- */
+  .btn {
+    border: 0; border-radius: 999px; padding: 16px 34px; min-width: 200px; min-height: 54px;
+    font-size: 18px; font-weight: 700; letter-spacing: .02em; color: #0b0d17;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    box-shadow: 0 10px 30px rgba(124, 240, 255, .25), inset 0 1px 0 rgba(255,255,255,.6);
+    transition: transform .12s ease, filter .12s ease;
+  }
+  .btn:active { transform: scale(.96); filter: brightness(.95); }
+  .btn:disabled { filter: grayscale(.7) brightness(.7); }
+  .btn-ghost {
+    background: rgba(255,255,255,.08); color: var(--text); border: 1px solid rgba(255,255,255,.18);
+    border-radius: 999px; padding: 12px 22px; min-height: 46px; font-size: 15px; font-weight: 600;
+  }
+  .btn-ghost:active { background: rgba(255,255,255,.16); }
+
+  /* ---------- Full screens (start / win / error) ---------- */
+  .screen {
+    position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 18px; padding: calc(var(--safe-top) + 24px) 24px calc(var(--safe-bottom) + 24px); text-align: center;
+    background:
+      radial-gradient(120% 60% at 50% 0%, rgba(178, 141, 255, .28), transparent 60%),
+      radial-gradient(90% 50% at 50% 100%, rgba(124, 240, 255, .18), transparent 60%),
+      var(--bg);
+  }
+  .screen.dim { background: rgba(6, 8, 18, .72); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); }
+  .title {
+    margin: 0; font-size: clamp(40px, 13vw, 64px); line-height: .95; font-weight: 900; letter-spacing: -.03em;
+    background: linear-gradient(180deg, #fff 20%, #c9d3ff); -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  .title small { display: block; font-size: .36em; letter-spacing: .4em; font-weight: 800; color: var(--accent); -webkit-text-fill-color: var(--accent); margin-top: 8px; }
+  .lead { margin: 0; max-width: 320px; color: var(--muted); font-size: 16px; line-height: 1.45; }
+  .badge {
+    display: inline-flex; align-items: center; gap: 8px; padding: 8px 14px; border-radius: 999px;
+    font-size: 13px; color: var(--text); background: rgba(255,255,255,.07); border: 1px solid rgba(255,255,255,.12); max-width: 330px;
+  }
+  .badge .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+  .badge.xr .dot { background: #3dffa8; box-shadow: 0 0 8px #3dffa8; }
+  .badge.cam .dot { background: #ffc94d; box-shadow: 0 0 8px #ffc94d; }
+  .badge.bad .dot { background: var(--danger); }
+  .note { font-size: 14px; color: var(--accent); min-height: 1em; margin: 0; max-width: 320px; }
+  .stack { display: flex; flex-direction: column; align-items: center; gap: 12px; }
+
+  /* Floating decorative marbles on the start screen */
+  .hero { position: relative; width: 240px; height: 120px; }
+  .hero .marble-css { position: absolute; animation: float 3.2s ease-in-out infinite; }
+
+  @keyframes float { 0%,100% { transform: translateY(0) } 50% { transform: translateY(-10px) } }
+
+  /* Glass marble drawn with CSS (score slots, flying marble, decorations). Colours come from --c/--cl/--cd/--cg. */
+  .marble-css, .slot.marble-css {
+    border-radius: 50%;
+    background:
+      radial-gradient(circle at 33% 28%, rgba(255,255,255,.95) 0 7%, rgba(255,255,255,0) 19%),
+      radial-gradient(circle at 62% 70%, rgba(255,255,255,.28) 0 6%, rgba(255,255,255,0) 14%),
+      radial-gradient(circle at 50% 55%, var(--cl) 0%, var(--c) 48%, var(--cd) 100%);
+    box-shadow: inset -2px -3px 6px rgba(0,0,0,.35), inset 2px 2px 5px rgba(255,255,255,.3), 0 0 12px var(--cg);
+  }
+
+  /* ---------- Score bar (HUD) ---------- */
+  #hud {
+    position: absolute; top: 0; left: 0; right: 0;
+    padding: calc(var(--safe-top) + 8px) 12px 10px;
+    background: linear-gradient(180deg, rgba(8,10,22,.85), rgba(8,10,22,.6));
+    backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+    border-bottom: 1px solid rgba(255,255,255,.08);
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .hud-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  .count { display: flex; align-items: baseline; gap: 4px; font-weight: 900; font-variant-numeric: tabular-nums; }
+  .count #countNum { font-size: 28px; display: inline-block; }
+  .count .sep, .count #countTotal { font-size: 20px; color: var(--muted); }
+  .count small { font-size: 12px; font-weight: 600; color: var(--muted); margin-left: 6px; letter-spacing: .08em; text-transform: uppercase; }
+  .bump { animation: bump .4s ease; }
+  @keyframes bump { 0% { transform: scale(1) } 40% { transform: scale(1.45); color: var(--accent) } 100% { transform: scale(1) } }
+  .hud-right { display: flex; align-items: center; gap: 10px; }
+  .timer { font-variant-numeric: tabular-nums; font-weight: 700; font-size: 15px; color: var(--muted); }
+  .icon-btn {
+    border: 1px solid rgba(255,255,255,.18); background: rgba(255,255,255,.08); border-radius: 999px;
+    height: 34px; min-width: 34px; padding: 0 10px; font-size: 16px; font-weight: 700; transition: background .2s, color .2s;
+  }
+  .icon-btn.armed { background: var(--danger); color: #fff; border-color: transparent; }
+  #restartBtn {
+    position: absolute; z-index: 1;
+    right: calc(env(safe-area-inset-right, 0px) + var(--reset-right));
+    top: calc(var(--safe-top) + 8px + var(--reset-top));
+    width: var(--reset-size); height: var(--reset-size); min-width: 0; padding: 0;
+  }
+  /* The score bar's first row keeps clear of the button, so it never covers the count or timer. */
+  #hud .hud-row {
+    padding-right: max(0px, calc(env(safe-area-inset-right, 0px) + var(--reset-right) + var(--reset-size) + 8px - 12px));
+  }
+  .panel .scan-count { font-size: 12px; opacity: .8; }
+  .slots { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; }
+  .slot {
+    width: var(--slot, 24px); height: var(--slot, 24px); border-radius: 50%;
+    background: rgba(255,255,255,.05); box-shadow: inset 0 0 0 2px var(--ce);
+  }
+  .slot.filled { animation: pop .45s cubic-bezier(.3,1.6,.5,1); }
+  @keyframes pop { 0% { transform: scale(.4) } 100% { transform: scale(1) } }
+
+  /* ---------- Reticle with focus progress ring ---------- */
+  #reticle {
+    position: absolute; left: 50%; top: 50%; width: 84px; height: 84px; margin: -42px 0 0 -42px;
+    transition: transform .2s ease; pointer-events: none;
+  }
+  #reticle svg { width: 100%; height: 100%; overflow: visible; filter: drop-shadow(0 0 3px rgba(0,0,0,.6)); }
+  #reticle .track { fill: none; stroke: rgba(255,255,255,.45); stroke-width: 3; }
+  #reticle .prog { fill: none; stroke: var(--accent); stroke-width: 5; stroke-linecap: round; transform: rotate(-90deg); transform-origin: 40px 40px; }
+  #reticle .tick { stroke: rgba(255,255,255,.85); stroke-width: 2.5; stroke-linecap: round; }
+  #reticle .dot { fill: #fff; }
+  #reticle.locked { transform: scale(1.12); }
+  #reticle.locked .track { stroke: rgba(124,240,255,.6); }
+
+  /* ---------- Toast / banners / panels ---------- */
+  /* Stack under the score bar for toasts. --hud-bottom is set from JS. */
+  #subHud {
+    position: absolute; left: 0; right: 0; top: calc(var(--hud-bottom, var(--safe-top)) + 8px);
+    display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 0 16px; pointer-events: none;
+  }
+  .toast {
+    max-width: 100%; width: max-content; padding: 10px 16px; border-radius: 14px; transform: translateY(-8px);
+    background: var(--panel); border: 1px solid rgba(255,255,255,.1); font-size: 14px; line-height: 1.35; text-align: center;
+    opacity: 0; transition: opacity .25s, transform .25s; backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+  }
+  .toast.show { opacity: 1; transform: none; }
+
+  a.btn { display: inline-flex; align-items: center; justify-content: center; text-decoration: none; }
+  .loc-note { margin: 0; max-width: 320px; font-size: 14px; line-height: 1.4; color: var(--muted); }
+  .reach-hint {
+    position: absolute; left: 50%; top: calc(50% + 50px); transform: translateX(-50%); white-space: nowrap;
+    padding: 6px 14px; border-radius: 999px; background: rgba(255, 185, 60, .94); color: #1d1400;
+    font-size: 14px; font-weight: 700; pointer-events: none;
+  }
+  .banner {
+    position: absolute; left: 16px; right: 16px; bottom: calc(var(--safe-bottom) + 24px); padding: 12px 14px; border-radius: 14px;
+    background: rgba(255, 107, 125, .9); color: #fff; font-weight: 600; font-size: 14px; text-align: center;
+  }
+  .panel {
+    position: absolute; left: 16px; right: 16px; bottom: calc(var(--safe-bottom) + 20px);
+    padding: 16px; border-radius: 20px; background: var(--panel); border: 1px solid rgba(255,255,255,.1);
+    backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); display: flex; flex-direction: column; gap: 12px; text-align: center;
+  }
+  .panel h2 { margin: 0; font-size: 18px; }
+  .panel p { margin: 0; color: var(--muted); font-size: 14px; line-height: 1.4; }
+  .bar { height: 8px; border-radius: 99px; background: rgba(255,255,255,.12); overflow: hidden; }
+  .bar > i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, var(--accent), var(--accent-2)); transition: width .3s; }
+
+  /* ---------- Win screen ---------- */
+  .card {
+    width: min(340px, 100%); padding: 28px 22px; border-radius: 26px; background: var(--panel);
+    border: 1px solid rgba(255,255,255,.12); display: flex; flex-direction: column; align-items: center; gap: 14px;
+    animation: rise .5s cubic-bezier(.2,1.3,.5,1);
+  }
+  @keyframes rise { from { transform: translateY(40px) scale(.9); opacity: 0 } to { transform: none; opacity: 1 } }
+  .card h2 { margin: 0; font-size: 28px; }
+  .time { font-size: 44px; font-weight: 900; font-variant-numeric: tabular-nums; color: var(--accent); }
+  .trophy { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; max-width: 280px; }
+  .trophy .marble-css { width: 22px; height: 22px; animation: float 2.4s ease-in-out infinite; }
+  .err-icon { font-size: 48px; }
+
+  /* ---------- Collect effects ---------- */
+  .flyer { position: absolute; left: 0; top: 0; will-change: transform; z-index: 5; }
+  .burst {
+    position: absolute; width: 60px; height: 60px; margin: -30px 0 0 -30px; border-radius: 50%;
+    border: 3px solid var(--c); animation: burst .5s ease-out forwards; z-index: 4;
+  }
+  @keyframes burst { from { transform: scale(.3); opacity: 1 } to { transform: scale(2.2); opacity: 0 } }
+
+  /* ---------- Portrait only ---------- */
+  #rotateHint {
+    position: absolute; inset: 0; display: none; align-items: center; justify-content: center; flex-direction: column; gap: 12px;
+    background: var(--bg); font-size: 18px; font-weight: 700; z-index: 20; pointer-events: auto;
+  }
+  @media (orientation: landscape) and (max-height: 520px) and (pointer: coarse) { #rotateHint { display: flex; } }
+
+  /* ---------- Debug panel (?debug=1) ---------- */
+  #debugPanel {
+    position: absolute; left: 8px; right: 8px; bottom: calc(var(--safe-bottom) + 8px); z-index: 30;
+    max-height: 36vh; overflow: hidden; padding: 8px 10px; border-radius: 10px;
+    background: rgba(0, 0, 0, .88); color: #9dffb0; white-space: pre-wrap; word-break: break-word;
+    font: 10.5px/1.35 ui-monospace, Menlo, Consolas, monospace;
+    pointer-events: none; /* taps go through to the buttons underneath */
+  }
+
+  /* ---------- During an AR session ----------
+     The camera image is behind the page (in the App Clip it is drawn natively behind the web view),
+     so the page itself must be see-through: only the score bar, reticle and small panels may show. */
+  html.xr-active, html.xr-active body, html.xr-active #scene, html.xr-active #overlay {
+    background: transparent !important; background-image: none !important;
+  }
+  html.xr-active #camera, html.xr-active #startScreen, html.xr-active #rotateHint { display: none !important; }
+
+  @media (prefers-reduced-motion: reduce) {
+    .hero .marble-css, .trophy .marble-css { animation: none; }
+  }
+</style>
+</head>
+<body>
+  <video id="camera" playsinline muted autoplay></video>
+  <canvas id="scene"></canvas>
+
+  <!-- Everything in #overlay stays visible inside a WebXR session (it is the DOM-overlay root). -->
+  <div id="overlay">
+
+    <!-- Score bar -->
+    <header id="hud" class="ui" hidden>
+      <div class="hud-row">
+        <div class="count" aria-live="polite">
+          <span id="countNum">0</span><span class="sep">/</span><span id="countTotal">10</span><small>marbles</small>
+        </div>
+        <div class="hud-right">
+          <span class="timer" id="timer">00:00</span>
+          <button id="restartBtn" class="icon-btn" aria-label="Restart round">↻</button>
+        </div>
+      </div>
+      <div id="slots" class="slots"></div>
+    </header>
+
+    <div id="subHud">
+      <div id="toast" class="toast" role="status"></div>
+    </div>
+    <div id="tracking" class="banner" hidden>Tracking lost. Move slowly and point at well-lit surfaces.</div>
+
+    <!-- Centre reticle. The .prog circle fills up during the focus time. -->
+    <div id="reticle" hidden>
+      <svg viewBox="0 0 80 80" aria-hidden="true">
+        <circle class="track" cx="40" cy="40" r="30"/>
+        <circle id="ring" class="prog" cx="40" cy="40" r="30"/>
+        <line class="tick" x1="40" y1="2" x2="40" y2="9"/>
+        <line class="tick" x1="40" y1="71" x2="40" y2="78"/>
+        <line class="tick" x1="2" y1="40" x2="9" y2="40"/>
+        <line class="tick" x1="71" y1="40" x2="78" y2="40"/>
+        <circle class="dot" cx="40" cy="40" r="2.5"/>
+      </svg>
+    </div>
+
+    <div id="reachHint" class="reach-hint" hidden>Come closer</div>
+
+    <!-- Room scanning panel (WebXR mode only) -->
+    <div id="scanPanel" class="panel ui" hidden>
+      <h2>Scanning your room…</h2>
+      <p id="scanText">Slowly move your phone around the room</p>
+      <div class="bar"><i id="scanBar"></i></div>
+      <p class="scan-count" id="scanCount"></p>
+    </div>
+
+    <!-- Start screen -->
+    <section id="startScreen" class="screen ui">
+      <div class="hero" id="hero"></div>
+      <h1 class="title">Marble Hunt<small>FREE PLAY</small></h1>
+      <p class="lead" id="leadText">Find the glass marbles hidden around your room. Hold the ring on one for 3 seconds, or tap it.</p>
+      <div class="badge" id="modeBadge"><span class="dot"></span><span id="modeText">Checking your device…</span></div>
+      <div class="stack">
+        <button id="startBtn" class="btn" disabled>Start</button>
+        <!-- iPhone/iPad: Safari has no WebXR, so this opens the same page in the Needle Go App Clip, which has it. -->
+        <a id="appClipBtn" class="btn" hidden>Open in AR</a>
+        <button id="newGameBtn" class="btn-ghost" hidden>New game</button>
+        <!-- Last resort for devices where neither AR route works. -->
+        <button id="noArBtn" class="btn-ghost" hidden>Play without AR</button>
+        <p class="loc-note" id="noArNote" hidden>Without AR, marbles can't stay fixed in the room.</p>
+      </div>
+      <p class="note" id="startMsg"></p>
+    </section>
+
+    <!-- Win screen -->
+    <section id="winScreen" class="screen dim ui" hidden>
+      <div class="card">
+        <div class="trophy" id="trophy"></div>
+        <h2>All marbles found!</h2>
+        <div class="lead">Time taken</div>
+        <div class="time" id="winTime">00:00</div>
+        <button id="againBtn" class="btn">Play again</button>
+      </div>
+    </section>
+
+    <!-- Error screen -->
+    <section id="errorScreen" class="screen ui" hidden>
+      <div class="err-icon" id="errIcon">📷</div>
+      <h2 id="errTitle" style="margin:0">Camera access blocked</h2>
+      <p class="lead" id="errText"></p>
+      <div class="stack">
+        <button id="errRetry" class="btn">Try again</button>
+        <button id="errAlt" class="btn-ghost" hidden>Play without camera</button>
+        <button id="errBack" class="btn-ghost">Back</button>
+      </div>
+    </section>
+
+    <div id="debugPanel" hidden></div>
+
+    <div id="rotateHint"><div style="font-size:44px">📱</div>Please turn your phone to portrait</div>
+  </div>
+
+<script type="module">
+import * as THREE from 'three';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+
+// =====================================================================
+//  GAME SETTINGS: change these to tune the game
+// =====================================================================
+
+/** Number of marbles hidden in each round. */
+const MARBLE_COUNT = 10;
+
+/** How long (in milliseconds) the reticle has to stay on a marble to collect it. */
+const FOCUS_TIME_MS = 3000;
+
+/** Real-world marble diameter in metres in AR (0.08 = 8 cm). Never scaled: its on-screen size comes from perspective only. */
+const MARBLE_DIAMETER_M = 0.08;
+
+/** In AR, a marble can only be collected (focus or tap) from within this many metres. */
+const COLLECT_DISTANCE_M = 1.5;
+
+/** AR: the room scan lasts at least this many seconds before any marble appears. */
+const SCAN_SECONDS = 15;
+
+/** AR: marbles float at the phone's height at the end of the scan, plus or minus up to this many metres. */
+const HEIGHT_VARIATION_M = 0.3;
+
+/**
+ * iPhone/iPad route into WebXR: this page's full URL (URL-encoded) is appended, and the page opens inside
+ * the Needle Go App Clip, where WebXR immersive-ar is available. The game itself is the same WebXR code.
+ */
+const APP_CLIP_BASE_URL = 'https://appclip.needle.tools/ar?url=';
+
+/**
+ * Marble types. Each type has its own colour and inner pattern.
+ * Recolour, rename, add or remove entries freely; marbles are shared out evenly between the types.
+ *   color: any CSS hex colour
+ *   core:  shape inside the glass: 'swirl' | 'catseye' | 'ring' | 'star' | 'crystal' | 'orb'
+ */
+const MARBLE_TYPES = [
+  { name: 'Ruby',     color: '#ff3355', core: 'swirl'   },
+  { name: 'Sapphire', color: '#2f80ff', core: 'catseye' },
+  { name: 'Emerald',  color: '#19d27c', core: 'ring'    },
+  { name: 'Amber',    color: '#ffb422', core: 'star'    },
+  { name: 'Amethyst', color: '#b65cff', core: 'crystal' },
+];
+
+// ----- Advanced settings ------------------------------------------------
+
+/** AR: marbles are placed this far (metres) from the player, spread in different directions… */
+const PLACE_DISTANCE_MIN_M = 1;
+const PLACE_DISTANCE_MAX_M = 4;
+/** …at least this far from any detected wall, furniture or other surface (and never behind one)… */
+const WALL_CLEARANCE_M = 0.3;
+/** …and at least this far from each other. */
+const MARBLE_SPACING_M = 0.8;
+/** AR: slow hover around each marble's fixed position: amplitude in metres, speed in radians per second. */
+const HOVER_AMPLITUDE_M = 0.015;
+const HOVER_SPEED = 1.3;
+/** AR: hide the parts of marbles behind real objects when the WebXR Depth API is available. */
+const USE_DEPTH_OCCLUSION = true;
+/** AR: marbles further than this (metres) are ignored when aiming (closer than this but beyond reach → "Come closer"). */
+const AR_AIM_DISTANCE = 15;
+
+/** Marble radius in metres in "Play without AR" mode, where marbles float about 2 m away. */
+const MARBLE_RADIUS_CAMERA = 0.045;
+
+/** Camera mode: marble distance from the player, in metres (sets how big they look). */
+const CAMERA_DISTANCE_MIN = 1.7;
+const CAMERA_DISTANCE_MAX = 2.6;
+/** Camera mode: how far down / up marbles can be, in degrees (negative = below eye level). */
+const CAMERA_PITCH_MIN_DEG = -55;
+const CAMERA_PITCH_MAX_DEG = 18;
+/** Camera mode: field of view along the long side of the phone camera, in degrees. Used to match 3D to video. */
+const CAMERA_LONG_SIDE_FOV_DEG = 63;
+
+/** Focus: the reticle counts as "on" a marble within this many pixels of its centre (or the marble's size, if bigger). */
+const FOCUS_TOLERANCE_PX = 26;
+/** Focus: brief sensor glitches shorter than this (ms) do not reset the ring. Set to 0 for a strict reset. */
+const FOCUS_GRACE_MS = 150;
+/** Tap: a tap counts as hitting a marble within this many pixels (keeps small marbles touch-friendly). */
+const TAP_TOLERANCE_PX = 44;
+/** "Play without AR" mode: marbles further than this (metres) cannot be aimed at. */
+const MAX_COLLECT_DISTANCE = 6;
+
+/** Visual: bobbing speed and height (height as a fraction of the marble radius). */
+const BOB_SPEED = 2.2;
+const BOB_HEIGHT = 0.8;
+/** Visual: halo size (times the radius) and its pulsing opacity range. */
+const HALO_SIZE = 5;
+const GLOW_MIN = 0.25;
+const GLOW_MAX = 0.6;
+
+/** AR scanning: if too little was found when the scan time ends, it is extended by this many seconds at a time. */
+const SCAN_EXTEND_SECONDS = 5;
+/** AR scanning: "enough" means at least this many surface points (any orientation)… */
+const SCAN_MIN_SURFACES = 25;
+/** …seen in at least this many of the 8 directions around the player. */
+const SCAN_MIN_DIRECTIONS = 5;
+/** AR scanning: after this many extensions the placement rules relax a little, so very open or tiny rooms still work. */
+const SCAN_RELAX_AFTER_EXTENSIONS = 4;
+/** AR scanning: surface points (walls, furniture, floor) are grouped into cells this big (metres). */
+const SURFACE_CELL = 0.15;
+/** AR scanning: ignore surfaces further than this (metres) from the player. */
+const SCAN_MAX_DISTANCE = 6;
+
+/** localStorage key for saved progress. Free Play has its own key, so it never mixes with the location version. */
+const STORAGE_KEY = 'marble-hunt-free-play-v1';
+
+// =====================================================================
+//  Helpers
+// =====================================================================
+const $ = (sel) => document.querySelector(sel);
+/** On-screen debug panel (?debug=1); defined by the plain script in <head>. */
+const D = window.MHDebug || { on: false, set() {}, log() {} };
+const errText = (e) => (e ? `${e.name || 'Error'}: ${e.message || e}` : 'unknown error');
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const rand = (a, b) => a + Math.random() * (b - a);
+const DEG = Math.PI / 180;
+
+function shuffle(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+function hexToRgb(hex) {
+  const n = parseInt(hex.replace('#', ''), 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+function mix(hex, target, t) {
+  const a = hexToRgb(hex);
+  return a.map((v, i) => Math.round(v + (target[i] - v) * t));
+}
+/** Sets the CSS variables used by .marble-css for a given colour. */
+function paintMarbleEl(el, hex) {
+  const [r, g, b] = hexToRgb(hex);
+  el.style.setProperty('--c', hex);
+  el.style.setProperty('--cl', `rgb(${mix(hex, [255, 255, 255], 0.55).join(',')})`);
+  el.style.setProperty('--cd', `rgb(${mix(hex, [0, 0, 0], 0.55).join(',')})`);
+  el.style.setProperty('--cg', `rgba(${r},${g},${b},.55)`);
+  el.style.setProperty('--ce', `rgba(${r},${g},${b},.45)`);
+}
+function formatTime(ms) {
+  const s = Math.floor(ms / 1000);
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  const mm = String(m).padStart(2, '0'), ss = String(sec).padStart(2, '0');
+  return h ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+}
+function vibrate(pattern) { try { navigator.vibrate && navigator.vibrate(pattern); } catch (e) { /* not supported */ } }
+const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
+// =====================================================================
+//  DOM references
+// =====================================================================
+const overlayEl = $('#overlay');
+const video = $('#camera');
+const canvas = $('#scene');
+const hud = $('#hud'), slotsEl = $('#slots'), countNum = $('#countNum'), countTotal = $('#countTotal'), timerEl = $('#timer');
+const restartBtn = $('#restartBtn');
+const reticleEl = $('#reticle'), ringEl = $('#ring');
+const RING_LEN = 2 * Math.PI * 30; // circumference of the progress circle (r = 30)
+ringEl.style.strokeDasharray = RING_LEN;
+ringEl.style.strokeDashoffset = RING_LEN;
+const toastEl = $('#toast'), trackingEl = $('#tracking');
+const scanPanel = $('#scanPanel'), scanText = $('#scanText'), scanBar = $('#scanBar'), scanCount = $('#scanCount');
+const startScreen = $('#startScreen'), startBtn = $('#startBtn'), newGameBtn = $('#newGameBtn'), startMsg = $('#startMsg');
+const modeBadge = $('#modeBadge'), modeText = $('#modeText');
+const winScreen = $('#winScreen'), winTime = $('#winTime'), againBtn = $('#againBtn'), trophyEl = $('#trophy');
+const errorScreen = $('#errorScreen');
+const appClipBtn = $('#appClipBtn'), noArBtn = $('#noArBtn'), noArNote = $('#noArNote'), reachHint = $('#reachHint');
+
+$('#leadText').textContent =
+  `Find the ${MARBLE_COUNT} glass marbles hidden around you. Hold the ring on one for ${FOCUS_TIME_MS / 1000} seconds, or tap it.`;
+
+// Decorative marbles on the start screen
+MARBLE_TYPES.forEach((t, i) => {
+  const el = document.createElement('div');
+  el.className = 'marble-css';
+  const size = 34 + (i % 2) * 14;
+  Object.assign(el.style, {
+    width: size + 'px', height: size + 'px',
+    left: (i * 44 + 8) + 'px', top: (i % 2 ? 10 : 50) + 'px',
+    animationDelay: (i * -0.6) + 's',
+  });
+  paintMarbleEl(el, t.color);
+  $('#hero').appendChild(el);
+});
+
+// =====================================================================
+//  Game state
+// =====================================================================
+const S = {
+  mode: null,          // 'xr' (WebXR) | 'camera' (getUserMedia + motion sensors)
+  phase: 'start',      // start | scanning | placing | playing | won | error
+  round: null,         // saved round: { v, total, slots:[{type, collected, yaw, pitch, dist}], elapsedMs, finished }
+  marbles: [],         // live 3D marbles in the scene
+  focus: { marble: null, ms: 0, lostMs: 0 },
+  busy: false,
+  lastSec: -1,
+};
+const support = { ready: false, xr: false, camera: false, secure: true, webgl: true };
+
+// ---------- Saving / loading ----------
+function loadRound() {
+  try {
+    const r = JSON.parse(localStorage.getItem(STORAGE_KEY));
+    if (!r || r.v !== 1 || r.total !== MARBLE_COUNT || !Array.isArray(r.slots) || r.slots.length !== MARBLE_COUNT) return null;
+    if (r.slots.some((s) => !(s.type >= 0 && s.type < MARBLE_TYPES.length))) return null;
+    return r;
+  } catch (e) { return null; }
+}
+function saveRound() {
+  try { if (S.round) localStorage.setItem(STORAGE_KEY, JSON.stringify(S.round)); } catch (e) { /* storage full / private mode */ }
+}
+/** Creates a fresh round: assigns types to slots and (for camera mode) a direction to each marble. */
+function newRound() {
+  const n = MARBLE_COUNT;
+  // Share marbles evenly between types, grouped by type so the score bar looks tidy.
+  const types = Array.from({ length: n }, (_, i) => i % MARBLE_TYPES.length).sort((a, b) => a - b);
+  // Spread directions evenly all around the player (360°), then shuffle so types are mixed.
+  const yaws = shuffle(Array.from({ length: n }, (_, i) => (i / n) * Math.PI * 2 + rand(-0.3, 0.3) * (Math.PI / n)));
+  S.round = {
+    v: 1, total: n, elapsedMs: 0, finished: false,
+    slots: types.map((type, i) => ({
+      type, collected: false,
+      yaw: yaws[i],
+      pitch: rand(CAMERA_PITCH_MIN_DEG, CAMERA_PITCH_MAX_DEG) * DEG,
+      dist: rand(CAMERA_DISTANCE_MIN, CAMERA_DISTANCE_MAX),
+    })),
+  };
+  saveRound();
+}
+const collectedCount = () => S.round ? S.round.slots.filter((s) => s.collected).length : 0;
+const allCollected = () => S.round && S.round.slots.every((s) => s.collected);
+
+// =====================================================================
+//  Audio (generated with WebAudio, no files needed)
+// =====================================================================
+let audioCtx = null, master = null;
+function ensureAudio() {
+  try {
+    if (!audioCtx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      audioCtx = new AC();
+      master = audioCtx.createGain();
+      master.gain.value = 0.6;
+      master.connect(audioCtx.destination);
+    }
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+  } catch (e) { /* audio unavailable */ }
+}
+function tone(freq, delay, dur, type = 'sine', vol = 0.2) {
+  if (!audioCtx) return;
+  const t = audioCtx.currentTime + delay;
+  const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+  o.type = type;
+  o.frequency.setValueAtTime(freq, t);
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(vol, t + 0.012);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g); g.connect(master);
+  o.start(t); o.stop(t + dur + 0.05);
+}
+function playCollectSound(typeIdx) {
+  const base = 660 * Math.pow(2, (typeIdx % 5) * 2 / 12); // each type has its own pitch
+  tone(base, 0, 0.35, 'triangle', 0.18);
+  tone(base * 1.5, 0.07, 0.4, 'sine', 0.14);
+  tone(base * 2, 0.14, 0.55, 'sine', 0.1);
+}
+function playClink() { tone(2600, 0, 0.09, 'sine', 0.08); tone(3900, 0.012, 0.07, 'sine', 0.05); }
+function playWinSound() {
+  [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => tone(f, i * 0.12, 0.5, 'triangle', 0.18));
+  tone(1318.5, 0.5, 1.0, 'sine', 0.12);
+}
+
+// =====================================================================
+//  Three.js scene
+// =====================================================================
+let renderer = null;
+try {
+  renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true, powerPreference: 'high-performance' });
+} catch (e) {
+  console.warn('WebGL unavailable', e);
+  support.webgl = false;
+}
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.01, 60);
+const world = new THREE.Group();
+scene.add(world);
+
+if (renderer) {
+  renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2));
+  renderer.setSize(innerWidth, innerHeight, false);
+  renderer.setClearColor(0x000000, 0);
+  // Soft studio reflections so the glass looks glossy.
+  const pmrem = new THREE.PMREMGenerator(renderer);
+  scene.environment = pmrem.fromScene(new RoomEnvironment(renderer), 0.04).texture;
+  pmrem.dispose();
+}
+// Neutral default lighting. In AR with WebXR light estimation, these are replaced by the room's real light.
+const hemi = new THREE.HemisphereLight(0xffffff, 0x445566, 0.7);
+scene.add(hemi);
+const sun = new THREE.DirectionalLight(0xffffff, 1.8);
+sun.position.set(0.6, 1, 0.4);
+scene.add(sun);
+const roomProbe = new THREE.LightProbe(); // ambient light of the real room (spherical harmonics), off by default
+roomProbe.intensity = 0;
+scene.add(roomProbe);
+
+function resetLighting() {
+  hemi.intensity = 0.7;
+  sun.color.set(0xffffff); sun.intensity = 1.8; sun.position.set(0.6, 1, 0.4);
+  roomProbe.intensity = 0;
+}
+/** Applies a WebXR light estimate: main light direction/colour plus ambient spherical harmonics. */
+function applyLightEstimate(est) {
+  if (est.sphericalHarmonicsCoefficients) {
+    roomProbe.sh.fromArray(est.sphericalHarmonicsCoefficients);
+    roomProbe.intensity = 1;
+    hemi.intensity = 0;
+  }
+  const c = est.primaryLightIntensity, d = est.primaryLightDirection;
+  if (c && d) {
+    const k = Math.max(1, c.x, c.y, c.z);
+    sun.color.setRGB(c.x / k, c.y / k, c.z / k);
+    sun.intensity = k;
+    sun.position.set(d.x, d.y, d.z);
+  }
+}
+
+// ---------- Depth occlusion (WebXR Depth API, CPU depth data) ----------
+// Every marble material gets a small fragment-shader test: if the real world (from the depth map) is
+// closer to the camera than this pixel of the marble, the pixel is discarded.
+const depthPlaceholder = new THREE.DataTexture(new Uint8Array([0, 0]), 1, 1, THREE.RGFormat);
+depthPlaceholder.needsUpdate = true;
+let depthTex = null;
+const occl = {
+  uDepthTex: { value: depthPlaceholder },
+  uDepthEnabled: { value: 0 },
+  uDepthFloat: { value: 0 },
+  uUvTransform: { value: new THREE.Matrix4() },
+  uRawToMeters: { value: 0 },
+  uViewportPx: { value: new THREE.Vector4(0, 0, 1, 1) },
+  uNearFar: { value: new THREE.Vector2(0.01, 60) },
+};
+const OCCL_GLSL = `
+uniform sampler2D uDepthTex;
+uniform float uDepthEnabled, uDepthFloat, uRawToMeters;
+uniform mat4 uUvTransform;
+uniform vec4 uViewportPx;
+uniform vec2 uNearFar;
+float mhRealDepth(vec2 viewUv) {
+  vec2 d = (uUvTransform * vec4(viewUv, 0.0, 1.0)).xy;
+  if (uDepthFloat > 0.5) return texture2D(uDepthTex, d).r * uRawToMeters;
+  vec2 p = texture2D(uDepthTex, d).rg;                   // 16-bit depth: low byte, high byte
+  return dot(p, vec2(255.0, 65280.0)) * uRawToMeters;
+}
+`;
+const OCCL_TEST = `
+  if (uDepthEnabled > 0.5) {
+    vec2 viewUv = (gl_FragCoord.xy - uViewportPx.xy) / uViewportPx.zw;
+    viewUv.y = 1.0 - viewUv.y;                            // normalized view coords have a top-left origin
+    float realD = mhRealDepth(viewUv);
+    float ndcZ = gl_FragCoord.z * 2.0 - 1.0;
+    float fragD = 2.0 * uNearFar.x * uNearFar.y / (uNearFar.y + uNearFar.x - ndcZ * (uNearFar.y - uNearFar.x));
+    if (realD > 0.0 && realD < fragD - 0.03) discard;     // a real object is in front of this pixel
+  }
+`;
+function addOcclusion(mat) {
+  mat.onBeforeCompile = (shader) => {
+    Object.assign(shader.uniforms, occl);
+    shader.fragmentShader = shader.fragmentShader.replace('void main() {', OCCL_GLSL + '\nvoid main() {\n' + OCCL_TEST);
+  };
+  mat.customProgramCacheKey = () => 'mh-occlusion';
+  return mat;
+}
+/** Uploads this frame's CPU depth map so the shaders can read it. */
+function uploadDepth(info) {
+  const w = info.width, h = info.height, isFloat = xr.depthFormat === 'float32';
+  if (!depthTex || depthTex.image.width !== w || depthTex.image.height !== h) {
+    if (depthTex) depthTex.dispose();
+    depthTex = isFloat
+      ? new THREE.DataTexture(new Float32Array(w * h), w, h, THREE.RedFormat, THREE.FloatType)
+      : new THREE.DataTexture(new Uint8Array(w * h * 2), w, h, THREE.RGFormat, THREE.UnsignedByteType); // RG8 (WebGL2)
+    depthTex.magFilter = depthTex.minFilter = THREE.NearestFilter; // packed bytes must not be blended
+    depthTex.generateMipmaps = false;
+    depthTex.unpackAlignment = 1;
+    occl.uDepthTex.value = depthTex;
+    occl.uDepthFloat.value = isFloat ? 1 : 0;
+  }
+  const src = isFloat ? new Float32Array(info.data) : new Uint8Array(info.data);
+  depthTex.image.data.set(src.subarray(0, depthTex.image.data.length));
+  depthTex.needsUpdate = true;
+  occl.uUvTransform.value.fromArray(info.normDepthBufferFromNormView.matrix);
+  occl.uRawToMeters.value = info.rawValueToMeters;
+  occl.uDepthEnabled.value = 1;
+}
+
+/** Makes a small radial-gradient texture on a canvas (used for halo and glint). */
+function canvasTexture(draw) {
+  const c = document.createElement('canvas');
+  c.width = c.height = 128;
+  draw(c.getContext('2d'));
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+const haloTex = canvasTexture((ctx) => {
+  const g = ctx.createRadialGradient(64, 64, 0, 64, 64, 64);
+  g.addColorStop(0, 'rgba(255,255,255,1)');
+  g.addColorStop(0.22, 'rgba(255,255,255,.55)');
+  g.addColorStop(0.55, 'rgba(255,255,255,.13)');
+  g.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, 128, 128);
+});
+// A camera-facing highlight: bright specular spot top-left + faint rim, the cheap trick that sells "glass".
+const glintTex = canvasTexture((ctx) => {
+  let g = ctx.createRadialGradient(42, 38, 0, 42, 38, 20);
+  g.addColorStop(0, 'rgba(255,255,255,.95)');
+  g.addColorStop(0.5, 'rgba(255,255,255,.35)');
+  g.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, 128, 128);
+  g = ctx.createRadialGradient(86, 92, 0, 86, 92, 12);
+  g.addColorStop(0, 'rgba(255,255,255,.35)');
+  g.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, 128, 128);
+  ctx.strokeStyle = 'rgba(255,255,255,.22)';
+  ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.arc(64, 64, 61, 0, Math.PI * 2); ctx.stroke();
+});
+
+/** Inner pattern geometry for each core style (sized relative to the marble radius r). */
+function coreGeometry(kind, r) {
+  switch (kind) {
+    case 'swirl':   return new THREE.TorusKnotGeometry(r * 0.36, r * 0.1, 64, 8, 2, 3);
+    case 'catseye': { const g = new THREE.SphereGeometry(r * 0.8, 20, 10); g.scale(1, 0.14, 0.6); g.rotateZ(0.5); return g; }
+    case 'ring':    return new THREE.TorusGeometry(r * 0.48, r * 0.12, 10, 32);
+    case 'star':    return new THREE.OctahedronGeometry(r * 0.62, 0);
+    case 'crystal': return new THREE.IcosahedronGeometry(r * 0.56, 0);
+    default:        return new THREE.SphereGeometry(r * 0.5, 16, 12);
+  }
+}
+
+// Geometries and materials are shared between marbles of the same type and size.
+const typeCache = new Map();
+function typeResources(typeIdx, r) {
+  const key = typeIdx + '@' + r;
+  if (typeCache.has(key)) return typeCache.get(key);
+  const t = MARBLE_TYPES[typeIdx];
+  const flat = t.core === 'star' || t.core === 'crystal';
+  const res = {
+    shellGeo: new THREE.SphereGeometry(r, 28, 18),
+    shellMat: new THREE.MeshPhysicalMaterial({
+      color: t.color, roughness: 0.04, metalness: 0, clearcoat: 1, clearcoatRoughness: 0.04,
+      transparent: true, opacity: 0.5, envMapIntensity: 2.2, depthWrite: false,
+    }),
+    coreGeo: coreGeometry(t.core, r),
+    coreMat: new THREE.MeshStandardMaterial({
+      color: t.color, emissive: t.color, emissiveIntensity: 0.55, roughness: 0.3, metalness: 0.1, flatShading: flat,
+    }),
+    glintMat: new THREE.SpriteMaterial({ map: glintTex, transparent: true, depthWrite: false }),
+  };
+  addOcclusion(res.shellMat); addOcclusion(res.coreMat); addOcclusion(res.glintMat);
+  typeCache.set(key, res);
+  return res;
+}
+
+/**
+ * Builds one marble: root (fixed position) → body (hovers / bobs) → core + glass shell + glint + halo.
+ * ar = true for AR marbles, which float at a fixed point in the room and only hover slightly.
+ */
+function createMarble(slot, typeIdx, r, ar) {
+  const res = typeResources(typeIdx, r);
+  const root = new THREE.Group();
+  const body = new THREE.Group();
+  root.add(body);
+
+  const core = new THREE.Mesh(res.coreGeo, res.coreMat);
+  core.rotation.set(Math.random() * 3, Math.random() * 3, 0);
+  const shell = new THREE.Mesh(res.shellGeo, res.shellMat);
+  shell.renderOrder = 2;
+  const glint = new THREE.Sprite(res.glintMat);
+  glint.scale.setScalar(r * 2.02);
+  glint.renderOrder = 3;
+  const halo = new THREE.Sprite(addOcclusion(new THREE.SpriteMaterial({
+    map: haloTex, color: MARBLE_TYPES[typeIdx].color, transparent: true, depthWrite: false, opacity: GLOW_MIN,
+  })));
+  halo.scale.setScalar(r * HALO_SIZE);
+  halo.renderOrder = 1;
+  body.add(core, shell, glint, halo);
+
+  return {
+    slot, type: typeIdx, radius: r, root, body, core, halo, glint, ar,
+    restY: 0,
+    phase: Math.random() * Math.PI * 2,
+    anchor: null, collected: false,
+  };
+}
+function removeMarble(m) {
+  world.remove(m.root);
+  m.halo.material.dispose();
+  if (m.anchor) { try { m.anchor.delete(); } catch (e) { /* session already gone */ } m.anchor = null; }
+}
+function clearMarbles() {
+  S.marbles.forEach(removeMarble);
+  S.marbles = [];
+  resetFocus();
+}
+
+// Wireframe "room" shown only when playing without a camera, so turning still feels like turning.
+const gridSphere = new THREE.LineSegments(
+  new THREE.WireframeGeometry(new THREE.SphereGeometry(8, 24, 12)),
+  new THREE.LineBasicMaterial({ color: 0x5a64a8, transparent: true, opacity: 0.35 })
+);
+gridSphere.visible = false;
+scene.add(gridSphere);
+
+// AR scanning visuals: dots where surfaces (walls, furniture, floor) were found + a ring on the surface you point at.
+const MAX_SCAN_POINTS = 2500;
+const scanGeo = new THREE.BufferGeometry();
+scanGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(MAX_SCAN_POINTS * 3), 3));
+scanGeo.setDrawRange(0, 0);
+const scanPoints = new THREE.Points(scanGeo, new THREE.PointsMaterial({
+  color: 0x7cf0ff, size: 0.03, sizeAttenuation: true, transparent: true, opacity: 0.85, depthWrite: false,
+}));
+scanPoints.frustumCulled = false;
+scanPoints.visible = false;
+scene.add(scanPoints);
+
+const surfaceRing = new THREE.Mesh(
+  new THREE.RingGeometry(0.035, 0.047, 32).rotateX(-Math.PI / 2),
+  new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.85 })
+);
+surfaceRing.matrixAutoUpdate = false;
+surfaceRing.visible = false;
+scene.add(surfaceRing);
+
+// 3D reticle, only used if the AR browser does not support the DOM overlay (the HTML reticle is invisible then).
+const reticle3D = new THREE.Group();
+const r3dTrack = new THREE.Mesh(new THREE.RingGeometry(0.011, 0.013, 48),
+  new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.6, depthTest: false }));
+const r3dProgGeo = new THREE.RingGeometry(0.0105, 0.0135, 64, 1, Math.PI / 2, -Math.PI * 2);
+const r3dProg = new THREE.Mesh(r3dProgGeo, new THREE.MeshBasicMaterial({ color: 0x7cf0ff, depthTest: false }));
+r3dTrack.renderOrder = r3dProg.renderOrder = 10;
+reticle3D.add(r3dTrack, r3dProg);
+reticle3D.visible = false;
+scene.add(reticle3D);
+
+// =====================================================================
+//  Screen-space helpers (shared by focus and tap, in both modes)
+// =====================================================================
+const _v = new THREE.Vector3(), _w = new THREE.Vector3(), _scr = { x: 0, y: 0, depth: 0 };
+const viewW = () => innerWidth, viewH = () => innerHeight;
+
+function marbleWorldPos(m, out) {
+  out.copy(m.root.position);
+  out.y += m.body.position.y;
+  return out;
+}
+/** Projects a world point to screen pixels. Returns null if it is behind the camera. */
+function projectToScreen(world, out) {
+  _v.copy(world).applyMatrix4(camera.matrixWorldInverse);
+  const depth = -_v.z;
+  if (depth <= 0.02) return null;
+  _v.applyMatrix4(camera.projectionMatrix);
+  out.x = (_v.x * 0.5 + 0.5) * viewW();
+  out.y = (-_v.y * 0.5 + 0.5) * viewH();
+  out.depth = depth;
+  return out;
+}
+/** On-screen radius in pixels of a sphere of radius r at a given depth. */
+function radiusPx(r, depth) {
+  return (r / depth) * camera.projectionMatrix.elements[5] * viewH() / 2;
+}
+/** Finds the closest uncollected marble to a screen point, within tolerance. Returns { m, dist } (metres) or null. */
+function pickMarbleAt(x, y, minTolPx, sizeFactor) {
+  const maxAim = S.mode === 'xr' ? AR_AIM_DISTANCE : MAX_COLLECT_DISTANCE;
+  let best = null, bestD = Infinity, bestDist = 0;
+  for (const m of S.marbles) {
+    if (m.collected) continue;
+    marbleWorldPos(m, _w);
+    const dist = _w.distanceTo(camera.position);
+    const p = projectToScreen(_w, _scr);
+    if (!p || dist > maxAim) continue;
+    const d = Math.hypot(p.x - x, p.y - y);
+    const tol = Math.max(minTolPx, radiusPx(m.radius, p.depth) * sizeFactor);
+    if (d <= tol && d < bestD) { best = m; bestD = d; bestDist = dist; }
+  }
+  return best ? { m: best, dist: bestDist } : null;
+}
+/** AR is in reach-limited mode: marbles must be within COLLECT_DISTANCE_M. */
+const tooFarAway = (hit) => !!hit && S.mode === 'xr' && hit.dist > COLLECT_DISTANCE_M;
+
+/** "Come closer" hint under the reticle; flash=true keeps it up for a moment (after a tap). */
+let reachFlashUntil = 0;
+function setReachHint(dist, flash = false) {
+  const now = performance.now();
+  if (flash) reachFlashUntil = now + 1500;
+  if (dist != null) {
+    reachHint.textContent = `Come closer · ${dist.toFixed(1)} m`;
+    reachHint.hidden = false;
+  } else if (now > reachFlashUntil) {
+    reachHint.hidden = true;
+  }
+}
+
+// =====================================================================
+//  Collecting
+// =====================================================================
+function resetFocus() {
+  S.focus.marble = null; S.focus.ms = 0; S.focus.lostMs = 0;
+  setRing(0, false);
+}
+function setRing(progress, locked) {
+  ringEl.style.strokeDashoffset = RING_LEN * (1 - clamp(progress, 0, 1));
+  reticleEl.classList.toggle('locked', locked);
+  r3dProg.geometry.setDrawRange(0, Math.floor(clamp(progress, 0, 1) * 64) * 6);
+}
+
+/** Focus collection: called every frame; the reticle must stay on the same marble for FOCUS_TIME_MS. */
+function updateFocus(dtMs) {
+  const hit = pickMarbleAt(viewW() / 2, viewH() / 2, FOCUS_TOLERANCE_PX, 1.15);
+  const far = tooFarAway(hit);                   // aiming at a marble that is out of reach: no progress
+  setReachHint(far ? hit.dist : null);
+  const target = hit && !far ? hit.m : null;
+  const F = S.focus;
+  if (target && target === F.marble) {
+    F.ms += dtMs; F.lostMs = 0;
+  } else if (target) {
+    F.marble = target; F.ms = 0; F.lostMs = 0;   // new marble: start over
+    vibrate(8);
+  } else if (F.marble) {
+    F.lostMs += dtMs;                            // looked away
+    if (F.lostMs > FOCUS_GRACE_MS) { F.marble = null; F.ms = 0; }
+  }
+  setRing(F.ms / FOCUS_TIME_MS, !!F.marble);
+  if (F.marble && F.ms >= FOCUS_TIME_MS) collect(F.marble);
+}
+
+function handleTap(x, y) {
+  if (S.phase !== 'playing') return;
+  const hit = pickMarbleAt(x, y, TAP_TOLERANCE_PX, 1.4);
+  if (!hit) return;
+  if (tooFarAway(hit)) { setReachHint(hit.dist, true); vibrate(20); return; }
+  collect(hit.m);
+}
+
+function collect(m) {
+  if (m.collected || S.phase !== 'playing') return;
+  m.collected = true;
+  const p = projectToScreen(marbleWorldPos(m, _w), _scr);
+  const from = p ? { x: p.x, y: p.y } : { x: viewW() / 2, y: viewH() / 2 };
+  const sizePx = p ? radiusPx(m.radius, p.depth) * 2 : 30;
+  removeMarble(m);
+  S.marbles = S.marbles.filter((x) => x !== m);
+  if (S.focus.marble === m) resetFocus();
+
+  S.round.slots[m.slot].collected = true;
+  saveRound();
+  playCollectSound(m.type);
+  vibrate([30, 30, 60]);
+  flyToSlot(m.slot, MARBLE_TYPES[m.type].color, from, sizePx, () => {
+    fillSlot(m.slot, true);
+    if (allCollected()) setTimeout(win, 300);
+  });
+}
+
+/** Animates a CSS marble from where the 3D marble was to its slot in the score bar. */
+function flyToSlot(slot, color, from, sizePx, done) {
+  const burst = document.createElement('div');
+  burst.className = 'burst';
+  burst.style.left = from.x + 'px'; burst.style.top = from.y + 'px';
+  burst.style.setProperty('--c', color);
+  burst.addEventListener('animationend', () => burst.remove());
+  overlayEl.appendChild(burst);
+
+  const target = slotEls[slot].getBoundingClientRect();
+  const size = clamp(sizePx, 20, 90);
+  const el = document.createElement('div');
+  el.className = 'flyer marble-css';
+  paintMarbleEl(el, color);
+  Object.assign(el.style, { width: size + 'px', height: size + 'px', left: (from.x - size / 2) + 'px', top: (from.y - size / 2) + 'px' });
+  overlayEl.appendChild(el);
+
+  const dx = target.left + target.width / 2 - from.x;
+  const dy = target.top + target.height / 2 - from.y;
+  const endScale = target.width / size;
+  if (!el.animate) { el.remove(); done(); return; }
+  const anim = el.animate([
+    { transform: 'translate(0,0) scale(1)' },
+    { transform: `translate(${dx * 0.2}px, ${dy * 0.1 - 50}px) scale(1.4)`, offset: 0.3 },
+    { transform: `translate(${dx}px, ${dy}px) scale(${endScale})` },
+  ], { duration: 720, easing: 'cubic-bezier(.45,.05,.55,.95)', fill: 'forwards' });
+  anim.onfinish = () => { el.remove(); done(); };
+}
+
+// =====================================================================
+//  Score bar
+// =====================================================================
+let slotEls = [];
+function buildSlots() {
+  slotsEl.innerHTML = '';
+  slotsEl.style.setProperty('--slot', MARBLE_COUNT > 14 ? '18px' : '24px');
+  slotEls = S.round.slots.map((s) => {
+    const el = document.createElement('div');
+    el.className = 'slot';
+    paintMarbleEl(el, MARBLE_TYPES[s.type].color);
+    slotsEl.appendChild(el);
+    if (s.collected) el.classList.add('marble-css');
+    return el;
+  });
+  countTotal.textContent = MARBLE_COUNT;
+  countNum.textContent = collectedCount();
+  timerEl.textContent = formatTime(S.round.elapsedMs);
+}
+function fillSlot(i, animate) {
+  const el = slotEls[i];
+  if (!el) return;
+  el.classList.add('marble-css', 'filled');
+  countNum.textContent = collectedCount();
+  if (animate) {
+    playClink();
+    countNum.classList.remove('bump'); void countNum.offsetWidth; countNum.classList.add('bump');
+  }
+}
+
+/** Play time only counts while hunting (not while scanning, paused or on the win screen). */
+function updateTimer(dtMs) {
+  if (S.phase !== 'playing' || document.hidden) return;
+  S.round.elapsedMs += dtMs;
+  const sec = Math.floor(S.round.elapsedMs / 1000);
+  if (sec !== S.lastSec) {
+    S.lastSec = sec;
+    timerEl.textContent = formatTime(S.round.elapsedMs);
+    if (sec % 2 === 0) saveRound();
+  }
+}
+
+// =====================================================================
+//  UI: toasts and screens
+// =====================================================================
+const toastQueue = [];
+let toastBusy = false;
+function toast(msg, ms = 3200) {
+  toastQueue.push([msg, ms]);
+  if (!toastBusy) nextToast();
+}
+function nextToast() {
+  const item = toastQueue.shift();
+  if (!item) { toastBusy = false; return; }
+  toastBusy = true;
+  toastEl.textContent = item[0];
+  toastEl.classList.add('show');
+  setTimeout(() => { toastEl.classList.remove('show'); setTimeout(nextToast, 300); }, item[1]);
+}
+/** Drops queued toasts and hides the current one (used when the location changes, so old news isn't shown). */
+function clearToasts() { toastQueue.length = 0; toastEl.classList.remove('show'); }
+
+function hideScreens() { startScreen.hidden = winScreen.hidden = errorScreen.hidden = true; }
+
+function showStart(msg = '') {
+  hideScreens();
+  hud.hidden = reticleEl.hidden = scanPanel.hidden = trackingEl.hidden = true;
+  startScreen.hidden = false;
+  startMsg.textContent = msg;
+  renderStartButtons();
+}
+
+/** The App Clip link for this exact page (full HTTPS URL, URL-encoded). */
+const appClipUrl = () => APP_CLIP_BASE_URL + encodeURIComponent(location.href);
+
+/**
+ * Start buttons for each route into the game:
+ *  - WebXR available (Android Chrome, or inside the App Clip): Start → AR
+ *  - iPhone/iPad Safari: "Open in AR" → App Clip
+ *  - neither: only "Play without AR" (camera + motion sensors)
+ */
+function renderStartButtons() {
+  const saved = S.round && !S.round.finished && !allCollected() && (collectedCount() > 0 || S.round.elapsedMs > 1000);
+  const progress = saved ? ` · ${collectedCount()} / ${MARBLE_COUNT}` : '';
+  const noXR = support.ready && !support.xr;
+  startBtn.hidden = noXR;
+  startBtn.textContent = saved ? `Continue${progress}` : 'Start';
+  appClipBtn.hidden = !(noXR && isIOS);
+  appClipBtn.href = appClipUrl();
+  newGameBtn.hidden = !saved || noXR;
+  noArBtn.hidden = noArNote.hidden = !noXR;
+  noArBtn.textContent = `Play without AR${progress}`;
+}
+
+function showWin() {
+  hideScreens();
+  reticleEl.hidden = scanPanel.hidden = true;
+  winTime.textContent = formatTime(S.round.elapsedMs);
+  trophyEl.innerHTML = '';
+  S.round.slots.forEach((s, i) => {
+    const el = document.createElement('div');
+    el.className = 'marble-css';
+    el.style.animationDelay = (i * -0.2) + 's';
+    paintMarbleEl(el, MARBLE_TYPES[s.type].color);
+    trophyEl.appendChild(el);
+  });
+  winScreen.hidden = false;
+}
+
+const ERRORS = {
+  'camera-denied': ['📷', 'Camera access blocked',
+    'Marble Hunt needs your camera to show your room. Allow camera access for this site in your browser settings (tap the icon next to the address bar, then Camera → Allow), then tap Try again.'],
+  'xr-denied': ['🕶️', 'AR permission declined',
+    "The AR session needs permission to use your camera. Tap Try again and accept the prompt, or play without AR (marbles can't stay fixed in the room then)."],
+  'xr-failed': ['🕶️', "AR couldn't start",
+    'On Android, make sure "Google Play Services for AR" is installed and up to date. On iPhone, open the game again through the App Clip. Then tap Try again.'],
+  'motion-denied': ['🧭', 'Motion access blocked',
+    'Motion sensors let you look around by moving your phone. You can still play by dragging the screen.'],
+  'no-camera': ['📷', 'No camera found', 'We could not find a camera on this device.'],
+  'camera-busy': ['📷', 'Camera is busy', 'Another app or tab is using the camera. Close it and tap Try again.'],
+  'camera-error': ['📷', 'Camera problem', 'The camera could not be started. Tap Try again.'],
+  'insecure': ['🔒', 'Secure connection needed', 'Camera access only works over HTTPS. Open this page with an https:// address.'],
+  'unsupported': ['📵', 'Device not supported',
+    'This browser cannot open the camera. Use Chrome on Android or Safari on iPhone (iOS 16.4 or newer).'],
+  'webgl': ['🧊', '3D graphics unavailable', 'Your browser has WebGL turned off or does not support it, so the marbles cannot be drawn.'],
+};
+function showError(kind, err) {
+  if (err) console.warn(kind, err);
+  const [icon, title, text] = ERRORS[kind] || ERRORS['camera-error'];
+  stopGameLoop();
+  S.phase = 'error';
+  if (!xr.session) S.mode = null;
+  hideScreens();
+  hud.hidden = reticleEl.hidden = scanPanel.hidden = trackingEl.hidden = true;
+  $('#errIcon').textContent = icon;
+  $('#errTitle').textContent = title;
+  $('#errText').textContent = (kind === 'xr-denied' || kind === 'xr-failed') && err ? `${text}\n\n(${errText(err)})` : text;
+  const canRetry = !['insecure', 'webgl', 'unsupported', 'no-camera'].includes(kind);
+  $('#errRetry').hidden = !canRetry;
+  // "Play without camera" lets people still enjoy the game (marbles float in a virtual room).
+  $('#errAlt').hidden = ['insecure', 'webgl'].includes(kind) ||
+    (support.xr && (kind === 'xr-denied' || kind === 'xr-failed')); // WebXR supported: never fall back
+  $('#errAlt').textContent = kind === 'xr-denied' || kind === 'xr-failed' ? 'Play without AR' : 'Play without camera';
+  $('#errAlt').dataset.kind = kind;
+  errorScreen.hidden = false;
+}
+
+// =====================================================================
+//  Starting a game
+// =====================================================================
+function startGame(fresh) {
+  if (S.busy || !support.ready) return;
+  ensureAudio(); // must happen inside the tap so iOS unlocks sound
+  if (!support.webgl) return showError('webgl');
+  if (!support.secure) return showError('insecure');
+  // Whenever WebXR immersive-ar is supported (Android Chrome, the iOS App Clip) the game always uses it;
+  // the camera + orientation mode is only for devices without WebXR ("Play without AR").
+  S.wantAR = support.xr;
+  if (!S.wantAR && !support.camera) return showError('unsupported');
+  D.set('mode', S.wantAR ? 'WebXR' : 'fallback (camera + orientation)');
+
+  if (fresh || !S.round || S.round.finished || allCollected()) newRound();
+  buildSlots();
+  hideScreens();
+  // This tap starts the session itself: requestSession (AR) or the iPhone motion prompt is the first call.
+  beginSession();
+}
+
+/** Starts the AR (or camera) session. Must run synchronously inside the tap. */
+function beginSession() {
+  if (S.busy) return;
+  S.busy = true;
+  S.phase = 'starting';
+  // NOTE: requestSession / requestPermission are the first calls in these functions, so they still
+  // run inside the tap ("user activation"), which browsers require.
+  const p = S.wantAR ? startXR().catch(onXRStartFailed) : startCameraMode();
+  p.finally(() => { S.busy = false; });
+}
+
+/**
+ * Shows this round's marbles: in AR, scan the room first (unless it was already scanned this session),
+ * then place them; in camera mode, spawn them around the player. Called when a session starts and on "Play again".
+ */
+function startRound(reason = 'start') {
+  if (!S.mode || S.phase === 'won' || S.phase === 'error') return;
+  clearMarbles();
+  const need = remainingSlots().length;
+  if (S.mode === 'camera' || need === 0) {
+    spawnCameraMarbles();   // camera mode; in AR this branch only runs when nothing is left, so it adds nothing
+    enterPlaying();
+  } else if (xr.scanComplete && prepareSpots()) {
+    S.phase = 'placing';    // the room was scanned earlier in this session: show the marbles right away
+    hud.hidden = false; scanPanel.hidden = true; reticleEl.hidden = true;
+    xr.pendingPlacement = true;
+  } else {
+    beginScanning();
+  }
+  if (reason === 'again') toast(`${MARBLE_COUNT} new marbles hidden. Go!`);
+}
+
+/** Leaves the game and returns to the start screen (progress stays saved). */
+function goHome() {
+  if (xr.session) { xr.session.end(); return; } // the session's end handler shows the start screen
+  stopCamera();
+  stopGameLoop();
+  clearMarbles();
+  gridSphere.visible = false;
+  S.mode = null;
+  S.phase = 'start';
+  showStart();
+}
+
+function onXRStartFailed(err) {
+  console.warn('WebXR failed', err);
+  D.log('AR start failed: ' + errText(err));
+  document.documentElement.classList.remove('xr-active');
+  if (xr.session) {
+    // Detach our end handler first so it can't reset the camera-mode game we start below.
+    xr.session.removeEventListener('end', onXREnd);
+    xr.session.removeEventListener('select', onXRSelect);
+    try { xr.session.end(); } catch (e) { /* ignore */ }
+    xr.session = null;
+    xr.hitSources = [];
+  }
+  stopGameLoop();
+  renderer.xr.enabled = false;
+  if (err && (err.name === 'NotAllowedError' || err.name === 'SecurityError')) return showError('xr-denied', err);
+  // Anything else (ARCore missing, App Clip closed…): explain, and offer "Play without AR" as a last resort.
+  return showError('xr-failed', err);
+}
+
+// The game loop runs only while a game is active (saves battery on menus).
+let lastFrameTime = 0;
+function startGameLoop() { lastFrameTime = performance.now(); renderer.setAnimationLoop(loop); }
+function stopGameLoop() { if (renderer) renderer.setAnimationLoop(null); }
+
+function loop(timeMs, frame) {
+  const now = performance.now();
+  const dtMs = Math.min(100, now - lastFrameTime);
+  lastFrameTime = now;
+
+  if (S.mode === 'xr' && frame) {
+    xrFrame(frame);
+    if (renderer.xr.isPresenting) {
+      renderer.xr.updateCamera(camera); // camera now holds this frame's XR pose
+      const views = renderer.xr.getCamera().cameras;
+      if (views.length) occl.uViewportPx.value.copy(views[0].viewport);
+      occl.uNearFar.value.set(camera.near, camera.far);
+    }
+  } else if (S.mode === 'camera') {
+    updateSensorCamera(dtMs);
+  }
+
+  animateMarbles(now / 1000, dtMs / 1000);
+  if (S.phase === 'playing') updateFocus(dtMs);
+  else if (!reachHint.hidden) reachHint.hidden = true;
+  updateTimer(dtMs);
+
+  if (reticle3D.visible) { // keep the fallback 3D reticle 0.5 m in front of the eyes
+    reticle3D.position.set(0, 0, -0.5).applyQuaternion(camera.quaternion).add(camera.position);
+    reticle3D.quaternion.copy(camera.quaternion);
+  }
+  renderer.render(scene, camera);
+}
+
+const _g = new THREE.Vector3();
+/**
+ * AR marbles stay at their fixed point in the room and only hover a couple of centimetres up and down
+ * (never scaled). "Play without AR" marbles bob and spin to be easier to spot. The glow pulses in both modes.
+ */
+function animateMarbles(t, dt) {
+  for (const m of S.marbles) {
+    const focused = S.focus.marble === m;
+    const pulse = Math.sin(t * 2.6 + m.phase * 1.3) * 0.5 + 0.5;
+    m.halo.material.opacity = GLOW_MIN + (GLOW_MAX - GLOW_MIN) * pulse + (focused ? 0.3 : 0);
+    if (m.ar) {
+      m.body.position.y = HOVER_AMPLITUDE_M * Math.sin(t * HOVER_SPEED + m.phase); // slow hover; root never moves
+    } else {
+      const s = Math.sin(t * BOB_SPEED + m.phase) * 0.5 + 0.5;
+      m.body.position.y = m.restY + s * m.radius * BOB_HEIGHT;
+      m.core.rotation.y += dt * 0.9;
+      m.core.rotation.z += dt * 0.35;
+      const hs = m.radius * HALO_SIZE * (focused ? 1.1 + 0.4 * (S.focus.ms / FOCUS_TIME_MS) : 1);
+      m.halo.scale.set(hs, hs, 1);
+    }
+    // The camera-facing highlight sits just inside the front of the glass, so it depth-tests correctly.
+    _g.copy(camera.position).sub(marbleWorldPos(m, _w));
+    const len = _g.length();
+    if (len > 1e-4) m.glint.position.copy(_g.multiplyScalar((m.radius * 0.9) / len));
+  }
+}
+
+function enterPlaying() {
+  S.phase = 'playing';
+  resetFocus();
+  scanPanel.hidden = true;
+  scanPoints.visible = false;
+  surfaceRing.visible = false;
+  hud.hidden = false;
+  const noOverlay = S.mode === 'xr' && !xr.hasOverlay;
+  reticleEl.hidden = noOverlay;
+  reticle3D.visible = noOverlay;
+  if (allCollected()) setTimeout(win, 300);
+}
+
+function win() {
+  if (S.phase === 'won') return;
+  S.phase = 'won';
+  S.round.finished = true;
+  saveRound();
+  resetFocus();
+  reticleEl.hidden = true;
+  reticle3D.visible = false;
+  playWinSound();
+  vibrate([80, 60, 80, 60, 160]);
+  // Without a DOM overlay the win screen would be invisible in AR, so leave AR first (the end handler shows it).
+  if (S.mode === 'xr' && xr.session && !xr.hasOverlay) { xr.session.end(); return; }
+  showWin();
+}
+
+function playAgain() {
+  ensureAudio();
+  newRound();
+  buildSlots();
+  winScreen.hidden = true;
+  clearMarbles();
+  xr.placed.clear();      // new marbles get new spots (the room map is kept)
+  if (S.mode && (S.mode === 'camera' || xr.session)) {
+    S.phase = 'playing';  // leave the 'won' state so startRound runs
+    startRound('again');
+  } else {
+    startGame(false);
+  }
+}
+
+// =====================================================================
+//  MODE 1: WebXR immersive AR (Android Chrome with ARCore, etc.)
+// =====================================================================
+// Free-space map seen from above: 10 cm cells over ±12 m. 0 = unknown, 1 = seen free, 2 = occupied (wall or
+// furniture at about marble height). Scan rays mark the cells they cross as free; walls block rays, so the space
+// behind them stays unknown.
+const GRID_CELL = 0.1, GRID_HALF = 120, GRID_N = GRID_HALF * 2;
+const xr = {
+  session: null, refSpace: null, viewerSpace: null, hitSources: [], hasOverlay: false,
+  placed: new Map(),            // slot index → spot, so a marble keeps its spot when you leave and come back
+  surfaces: new Map(),          // room map: surface points of any orientation (walls, furniture, floor), key = cell
+  sectors: new Set(),           // which of the 8 directions around the player have surfaces in the map
+  planes: new Map(),            // detected planes (XRPlane → { inv, poly, up }) for wall checks
+  grid: new Uint8Array(GRID_N * GRID_N), freeCells: 0, // free-space map (see GRID_CELL)
+  scanDuration: 0, scanExtensions: 0, scanComplete: false, scanHeight: null,
+  features: null,               // Set of enabled optional features (null if the browser doesn't say)
+  anchors: false, depth: false, depthFormat: '', lightProbe: null,
+  viewer: new THREE.Vector3(),
+  frameCount: 0, scanStart: 0, pendingPlacement: false, lostSince: 0,
+};
+// Several hit-test rays fan out from the screen so scanning maps the room faster.
+// They point in all directions from the screen (left/right/up/down) so walls and furniture are found, not only the floor.
+const HIT_RAYS = [[0, 0], [0.3, 0], [-0.3, 0], [0, 0.3], [0, -0.3], [0.3, 0.3], [-0.3, 0.3], [0.3, -0.35], [-0.3, -0.35], [0, -0.55]];
+
+/** Was an optional WebXR feature granted? (If the browser doesn't report it, the API checks at each use decide.) */
+const xrHas = (f) => (xr.features ? xr.features.has(f) : true);
+
+/**
+ * The one AR code path for every platform: Android Chrome (ARCore) starts it from the Start button,
+ * iPhone/iPad reach it inside the Needle Go App Clip. Only hit-test is required; everything else is optional.
+ */
+async function startXR() {
+  // First call: must stay inside the user's tap (or the 'sessiongranted' event). Nothing is awaited before it.
+  let session;
+  D.set('requestSession', 'pending...');
+  try {
+    session = await navigator.xr.requestSession('immersive-ar', {
+      requiredFeatures: ['hit-test'],
+      optionalFeatures: ['dom-overlay', 'anchors', 'plane-detection', 'depth-sensing', 'light-estimation'],
+      domOverlay: { root: overlayEl },
+      depthSensing: { usagePreference: ['cpu-optimized'], dataFormatPreference: ['luminance-alpha', 'float32'] },
+    });
+  } catch (e) {
+    D.set('requestSession', 'FAILED: ' + errText(e));
+    if (e && (e.name === 'NotAllowedError' || e.name === 'SecurityError')) throw e;
+    // Some WebXR implementations reject optional features they don't know: retry with the bare minimum.
+    D.log('retrying requestSession with hit-test + dom-overlay only');
+    try {
+      session = await navigator.xr.requestSession('immersive-ar', {
+        requiredFeatures: ['hit-test'], optionalFeatures: ['dom-overlay'], domOverlay: { root: overlayEl },
+      });
+    } catch (e2) { D.set('requestSession', 'FAILED (also minimal retry): ' + errText(e2)); throw e2; }
+  }
+  D.set('requestSession', 'OK');
+  xr.session = session;
+  xr.features = session.enabledFeatures ? new Set(session.enabledFeatures) : null;
+  D.set('enabled features', session.enabledFeatures ? [...session.enabledFeatures].join(', ') || '(none)' : '(not reported)');
+  D.set('dom overlay', session.domOverlayState ? session.domOverlayState.type : 'none');
+
+  // Everything behind the 3D content must be transparent so the camera image shows through.
+  document.documentElement.classList.add('xr-active');
+  scene.background = null;
+  renderer.setClearColor(0x000000, 0);
+  D.set('backgrounds', `html ${getComputedStyle(document.documentElement).backgroundColor}, body ${getComputedStyle(document.body).backgroundColor}`);
+  S.mode = 'xr';
+  stopCamera();
+  gridSphere.visible = false;
+
+  renderer.xr.enabled = true;
+  renderer.xr.setReferenceSpaceType('local');
+  await renderer.xr.setSession(session);
+  xr.refSpace = renderer.xr.getReferenceSpace();
+  xr.viewerSpace = await session.requestReferenceSpace('viewer');
+
+  xr.hitSources = [];
+  for (const [dx, dy] of HIT_RAYS) {
+    try {
+      const offsetRay = (dx || dy) && window.XRRay
+        ? new XRRay({ x: 0, y: 0, z: 0, w: 1 }, { x: dx, y: dy, z: -1, w: 0 })
+        : undefined;
+      xr.hitSources.push(await session.requestHitTestSource({ space: xr.viewerSpace, offsetRay }));
+    } catch (e) { /* this ray is not supported; others still work */ }
+  }
+  if (!xr.hitSources.length) throw new Error('No hit-test source available');
+
+  xr.hasOverlay = !!session.domOverlayState;
+
+  // Optional features, each checked before use.
+  xr.anchors = xrHas('anchors') && typeof XRFrame !== 'undefined' && 'createAnchor' in XRFrame.prototype;
+  xr.depth = false;
+  if (USE_DEPTH_OCCLUSION && renderer.capabilities.isWebGL2 && xrHas('depth-sensing')) {
+    try { xr.depth = session.depthUsage === 'cpu-optimized'; xr.depthFormat = session.depthDataFormat; }
+    catch (e) { xr.depth = false; } // the getters throw when depth sensing was not granted
+  }
+  xr.lightProbe = null;
+  if (xrHas('light-estimation') && typeof session.requestLightProbe === 'function') {
+    try { xr.lightProbe = await session.requestLightProbe(); } catch (e) { xr.lightProbe = null; }
+  }
+
+  session.addEventListener('select', onXRSelect);
+  session.addEventListener('end', onXREnd);
+  D.set('AR extras', `anchors ${xr.anchors ? 'yes' : 'no'}, depth ${xr.depth ? 'yes' : 'no'}, light ${xr.lightProbe ? 'yes' : 'no'}, hit-test sources ${xr.hitSources.length}`);
+
+  clearMarbles();
+  resetRoomMap();
+  xr.frameCount = 0;
+  startGameLoop();
+  const extras = [xr.anchors && 'anchors', xr.depth && 'occlusion', xr.lightProbe && 'room lighting'].filter(Boolean);
+  toast('Full AR: marbles float at fixed spots in your room.' + (extras.length ? ` Using ${extras.join(', ')}.` : ''), 3500);
+  startRound('start'); // room scan first, then the marbles
+}
+
+// Tapping overlay buttons / the score bar must not also count as a tap in the AR scene.
+overlayEl.addEventListener('beforexrselect', (e) => {
+  if (e.target.closest && e.target.closest('button, a, #hud, .panel, .screen, #debugPanel')) e.preventDefault();
+});
+
+/** Starts the room scan (at least SCAN_SECONDS). Marbles appear only once it is complete. */
+function beginScanning() {
+  S.phase = 'scanning';
+  xr.scanStart = performance.now();
+  xr.scanDuration = SCAN_SECONDS;
+  xr.scanExtensions = 0;
+  scanPoints.visible = true;
+  hud.hidden = false;
+  reticleEl.hidden = true;
+  reticle3D.visible = false;
+  scanPanel.hidden = false;
+  scanText.textContent = 'Slowly move your phone around the room';
+  scanBar.style.width = '0%';
+  scanCount.textContent = '';
+}
+
+/** Forgets the room map (new place or new AR session). */
+function resetRoomMap() {
+  xr.surfaces.clear();
+  xr.grid.fill(0); xr.freeCells = 0;
+  xr.sectors.clear();
+  xr.planes.clear();
+  scanGeo.setDrawRange(0, 0);
+  xr.placed.clear();
+  xr.scanComplete = false;
+  xr.scanHeight = null;
+}
+
+/** Marbles not collected yet. */
+const remainingSlots = () => S.round.slots.map((s, i) => (s.collected ? -1 : i)).filter((i) => i >= 0);
+
+/** Runs every AR frame: tracking, room scanning, placing marbles, keeping anchors in sync. */
+function xrFrame(frame) {
+  xr.frameCount++;
+  const pose = frame.getViewerPose(xr.refSpace);
+  if (D.on && xr.frameCount % 30 === 1) D.set('XR frames', `${xr.frameCount}, viewer pose ${pose ? 'ok' : 'none'}, phase ${S.phase}`);
+  if (!pose) {
+    if (!xr.lostSince) xr.lostSince = performance.now();
+    trackingEl.hidden = performance.now() - xr.lostSince < 600;
+    return;
+  }
+  xr.lostSince = 0;
+  trackingEl.hidden = true;
+  const p = pose.transform.position;
+  xr.viewer.set(p.x, p.y, p.z);
+
+  if (xr.lightProbe) {
+    try { const est = frame.getLightEstimate(xr.lightProbe); if (est) applyLightEstimate(est); } catch (e) { /* not ready */ }
+  }
+  if (xr.depth) {
+    let info = null;
+    try { info = frame.getDepthInformation(pose.views[0]); } catch (e) { /* depth not ready yet */ }
+    if (info && info.data) uploadDepth(info); else occl.uDepthEnabled.value = 0;
+  }
+
+  const scanning = S.phase === 'scanning';
+  // Keep collecting surface spots while playing too (less often) so "Play again" has a fresh map,
+  // but not while away from a marble location: those spots would belong to the wrong place.
+  const mapping = scanning || S.phase === 'playing' || S.phase === 'placing';
+  if (mapping && (scanning || xr.frameCount % 8 === 0)) collectHitSpots(frame, scanning);
+  if (mapping && xr.frameCount % (scanning ? 12 : 45) === 0) collectPlaneSpots(frame);
+  if (scanning && xr.frameCount % 6 === 0) updateScanUI();
+
+  if (xr.pendingPlacement) {
+    xr.pendingPlacement = false;
+    placeMarblesXR(frame);
+    enterPlaying();
+    toast(`${remainingSlots().length} marbles hidden. Walk around and find them!`);
+  }
+
+  // Anchors let the AR system correct marble positions as its map of the room improves.
+  for (const m of S.marbles) {
+    if (!m.anchor) continue;
+    const ap = frame.getPose(m.anchor.anchorSpace, xr.refSpace);
+    if (ap) { const t = ap.transform.position; m.root.position.set(t.x, t.y, t.z); }
+  }
+}
+
+/** Index of the free-space map cell under world point (x, z), or -1 outside the map. */
+function gridIndex(x, z) {
+  const i = Math.floor(x / GRID_CELL) + GRID_HALF, j = Math.floor(z / GRID_CELL) + GRID_HALF;
+  return i < 0 || j < 0 || i >= GRID_N || j >= GRID_N ? -1 : j * GRID_N + i;
+}
+/** A scan ray from the eye o to a hit: the cells it crossed are free; a hit at about marble height is occupied. */
+function markRay(o, hx, hy, hz) {
+  const dx = hx - o.x, dz = hz - o.z, L = Math.hypot(dx, dz), g = xr.grid;
+  for (let t = 0; t < L - 0.15; t += 0.05) {
+    const k = gridIndex(o.x + (dx * t) / L, o.z + (dz * t) / L);
+    if (k >= 0 && g[k] === 0) { g[k] = 1; xr.freeCells++; }
+  }
+  if (Math.abs(hy - o.y) < 0.65) { const k = gridIndex(hx, hz); if (k >= 0) { if (g[k] === 1) xr.freeCells--; g[k] = 2; } }
+}
+
+/** Adds a surface point of any orientation (wall, furniture, floor…) to the room map, and shows it as a dot. */
+function addSurface(x, y, z) {
+  const dx = x - xr.viewer.x, dz = z - xr.viewer.z, d2 = dx * dx + dz * dz;
+  if (d2 > SCAN_MAX_DISTANCE * SCAN_MAX_DISTANCE || xr.surfaces.size >= MAX_SCAN_POINTS) return;
+  const key = `${Math.round(x / SURFACE_CELL)}|${Math.round(y / SURFACE_CELL)}|${Math.round(z / SURFACE_CELL)}`;
+  if (xr.surfaces.has(key)) return;
+  const i = xr.surfaces.size;
+  xr.surfaces.set(key, new THREE.Vector3(x, y, z));
+  if (d2 > 0.25) { // which of the 8 directions around the player this point is in
+    const yaw = (Math.atan2(-dx, -dz) + Math.PI * 2) % (Math.PI * 2);
+    xr.sectors.add(Math.floor(yaw / (Math.PI / 4)) % 8);
+  }
+  const attr = scanGeo.getAttribute('position');
+  attr.setXYZ(i, x, y, z);
+  attr.needsUpdate = true;
+  scanGeo.setDrawRange(0, i + 1);
+}
+
+function collectHitSpots(frame, scanning) {
+  let centreHit = false;
+  xr.hitSources.forEach((src, i) => {
+    const results = frame.getHitTestResults(src);
+    if (!results.length) return;
+    const hp = results[0].getPose(xr.refSpace);
+    if (!hp) return;
+    const m = hp.transform.matrix;           // column-major; the pose's Y axis is the surface normal
+    if (i === 0 && scanning) { surfaceRing.matrix.fromArray(m); surfaceRing.matrixWorldNeedsUpdate = true; centreHit = true; }
+    addSurface(m[12], m[13], m[14]);              // every surface counts for the room map (walls too)
+    markRay(xr.viewer, m[12], m[13], m[14]);      // the space up to this hit is free
+  });
+  surfaceRing.visible = scanning && centreHit;
+}
+
+/**
+ * Plane detection (if available): every detected plane, horizontal or vertical (walls), is kept for the
+ * placement checks and sampled into the room map.
+ */
+function collectPlaneSpots(frame) {
+  if (!xrHas('plane-detection')) return;
+  let planes;
+  try { planes = frame.detectedPlanes; } catch (e) { return; }
+  if (!planes) return;
+  planes.forEach((plane) => {
+    const pp = frame.getPose(plane.planeSpace, xr.refSpace);
+    const poly = plane.polygon;
+    if (!pp || !poly || poly.length < 3) return;
+    const m = pp.transform.matrix;
+    const up = m[5] > 0.8;
+    let snap = xr.planes.get(plane);
+    if (!snap) { snap = { inv: new THREE.Matrix4() }; xr.planes.set(plane, snap); }
+    snap.inv.fromArray(m).invert();
+    snap.poly = Array.from(poly, (v) => ({ x: v.x, z: v.z }));
+    snap.up = up;
+    let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+    for (const v of poly) { minX = Math.min(minX, v.x); maxX = Math.max(maxX, v.x); minZ = Math.min(minZ, v.z); maxZ = Math.max(maxZ, v.z); }
+    for (let k = 0; k < 6; k++) {
+      for (let tries = 0; tries < 8; tries++) {
+        const x = rand(minX, maxX), z = rand(minZ, maxZ);
+        if (!pointInPolygon(x, z, poly)) continue;
+        const wx = m[0] * x + m[8] * z + m[12], wy = m[1] * x + m[9] * z + m[13], wz = m[2] * x + m[10] * z + m[14];
+        addSurface(wx, wy, wz);
+        markRay(xr.viewer, wx, wy, wz);
+        break;
+      }
+    }
+  });
+}
+function pointInPolygon(x, z, poly) {
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const a = poly[i], b = poly[j];
+    if ((a.z > z) !== (b.z > z) && x < ((b.x - a.x) * (z - a.z)) / (b.z - a.z) + a.x) inside = !inside;
+  }
+  return inside;
+}
+
+/** Scan progress; when the time is up, place the marbles if the room map is good enough, otherwise extend. */
+function updateScanUI() {
+  const elapsed = (performance.now() - xr.scanStart) / 1000;
+  scanBar.style.width = Math.min(100, (elapsed / xr.scanDuration) * 100) + '%';
+  scanCount.textContent = `${xr.surfaces.size} surface points · ${xr.sectors.size} / 8 directions`;
+  if (D.on) D.set('scan', `${elapsed.toFixed(0)} / ${xr.scanDuration} s, ${xr.surfaces.size} surfaces, ${xr.sectors.size}/8 directions, ${(xr.freeCells * GRID_CELL * GRID_CELL).toFixed(1)} m² seen free, ${xr.planes.size} planes`);
+  if (elapsed < xr.scanDuration) return;
+
+  const relaxed = xr.scanExtensions >= SCAN_RELAX_AFTER_EXTENSIONS;
+  const enough = xr.surfaces.size >= SCAN_MIN_SURFACES && xr.sectors.size >= SCAN_MIN_DIRECTIONS;
+  xr.scanHeight = xr.viewer.y; // marbles float around the phone's height at the end of the scan
+  if ((enough || relaxed) && prepareSpots(relaxed)) {
+    xr.scanComplete = true;
+    xr.pendingPlacement = true;
+    D.log(`scan complete after ${elapsed.toFixed(0)} s${relaxed ? ' (relaxed rules)' : ''}`);
+    return;
+  }
+  xr.scanDuration += SCAN_EXTEND_SECONDS;
+  xr.scanExtensions++;
+  scanText.textContent = 'Keep scanning, point at walls and furniture';
+  D.log(`scan extended to ${xr.scanDuration} s (${enough ? 'no valid spots yet' : 'too few surfaces'})`);
+}
+
+// ---------- Choosing floating marble spots from the room map ----------
+const _sd = new THREE.Vector3(), _st = new THREE.Vector3(), _lp = new THREE.Vector3(), _le = new THREE.Vector3();
+/** Squared distance from point p to the segment a–b. */
+function segDist2(a, b, p) {
+  _sd.subVectors(b, a);
+  const len2 = _sd.lengthSq();
+  const t = len2 ? clamp(_st.subVectors(p, a).dot(_sd) / len2, 0, 1) : 0;
+  return _st.copy(a).addScaledVector(_sd, t).distanceToSquared(p);
+}
+/** Distance in a plane's own x/z coordinates from a point to the plane polygon's outline. */
+function distToPolygon(x, z, poly) {
+  let best = Infinity;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const a = poly[j], b = poly[i], ex = b.x - a.x, ez = b.z - a.z, l2 = ex * ex + ez * ez;
+    const t = l2 ? clamp(((x - a.x) * ex + (z - a.z) * ez) / l2, 0, 1) : 0;
+    best = Math.min(best, Math.hypot(a.x + ex * t - x, a.z + ez * t - z));
+  }
+  return best;
+}
+/** Is P too close to this detected plane, or is the plane between the player's eye and P? */
+function planeBlocks(pl, eye, P) {
+  _lp.copy(P).applyMatrix4(pl.inv);
+  _le.copy(eye).applyMatrix4(pl.inv);
+  if (Math.abs(_lp.y) < WALL_CLEARANCE_M &&
+      (pointInPolygon(_lp.x, _lp.z, pl.poly) || distToPolygon(_lp.x, _lp.z, pl.poly) < WALL_CLEARANCE_M)) return true;
+  if (_lp.y * _le.y < 0) { // the line of sight crosses the plane: is the crossing point on the plane?
+    const t = _le.y / (_le.y - _lp.y);
+    if (pointInPolygon(_le.x + (_lp.x - _le.x) * t, _le.z + (_lp.z - _le.z) * t, pl.poly)) return true;
+  }
+  return false;
+}
+/**
+ * Line of sight from a to b in the free-space map: no occupied cell on it and, if needSeen, every cell on it was
+ * seen free during the scan. This keeps marbles inside the room and never behind a wall, even one the scan
+ * did not map (walls block scan rays, so the space behind them is never marked free).
+ */
+function gridPathClear(a, b, needSeen) {
+  const dx = b.x - a.x, dz = b.z - a.z, L = Math.hypot(dx, dz);
+  for (let t = 0; t <= L; t += 0.05) {
+    const k = gridIndex(a.x + (dx * t) / (L || 1), a.z + (dz * t) / (L || 1));
+    const v = k < 0 ? 0 : xr.grid[k];
+    if (v === 2 || (needSeen && v !== 1)) return false;
+  }
+  return true;
+}
+/**
+ * Clearance around P in the free-space map: no occupied cell within r metres and, if needSeen, every cell within
+ * r was seen free. The second part also keeps marbles away from objects the AR system never reported (the scan
+ * simply could not see past them, so their footprint is not free).
+ */
+function gridClearAround(P, r, needSeen) {
+  const n = Math.ceil(r / GRID_CELL) + 1, ci = Math.floor(P.x / GRID_CELL), cj = Math.floor(P.z / GRID_CELL), r2 = (r + GRID_CELL / 2) ** 2;
+  for (let j = cj - n; j <= cj + n; j++) for (let i = ci - n; i <= ci + n; i++) {
+    const cx = (i + 0.5) * GRID_CELL, cz = (j + 0.5) * GRID_CELL;
+    if ((cx - P.x) ** 2 + (cz - P.z) ** 2 > r2) continue;
+    const k = gridIndex(cx, cz), v = k < 0 ? 0 : xr.grid[k];
+    if (v === 2 || (needSeen && v !== 1)) return false;
+  }
+  return true;
+}
+/** All placement rules for one floating spot P, seen from the player's eye. */
+function spotIsValid(P, eye, others, relaxed) {
+  const spacing = relaxed ? 0.5 : MARBLE_SPACING_M;
+  for (const o of others) if (o.distanceToSquared(P) < spacing * spacing) return false;
+  if (!gridPathClear(eye, P, !relaxed)) return false;    // seen-free line of sight: inside the room, not behind a wall
+  if (!gridClearAround(P, WALL_CLEARANCE_M, !relaxed)) return false; // 0.3 m of seen-free space all around
+  // Surfaces are stored as points SURFACE_CELL apart, so the real surface can lie up to one cell beyond the
+  // nearest point: checking against WALL_CLEARANCE_M + SURFACE_CELL keeps the true gap at least WALL_CLEARANCE_M.
+  const clear = WALL_CLEARANCE_M + SURFACE_CELL, clear2 = clear * clear, sight2 = 0.2 * 0.2;
+  for (const q of xr.surfaces.values()) {
+    if (q.distanceToSquared(P) < clear2) return false;  // too close to a wall / furniture
+    if (segDist2(eye, P, q) < sight2) return false;     // a surface between player and spot: it would be behind a wall
+  }
+  for (const pl of xr.planes.values()) if (planeBlocks(pl, eye, P)) return false;
+  return true;
+}
+/**
+ * Picks n floating spots around the player: different directions, PLACE_DISTANCE_MIN_M–MAX_M away, at the
+ * scan-end phone height ± HEIGHT_VARIATION_M, clear of walls and furniture. Returns null if not possible yet.
+ */
+function pickAirSpots(n, kept, relaxed) {
+  const eye = xr.viewer.clone();
+  const h0 = xr.scanHeight != null ? xr.scanHeight : eye.y;
+  const minDist = relaxed ? 0.7 : PLACE_DISTANCE_MIN_M;
+  const sector = (Math.PI * 2) / Math.max(n, 1), base = Math.random() * Math.PI * 2;
+  const chosen = [];
+  for (let i = 0; i < n; i++) {
+    let spot = null;
+    for (let a = 0; a < 140 && !spot; a++) {
+      // first try this marble's own direction (so the marbles surround the player), then any direction
+      const yaw = a < 60 ? base + (i + Math.random()) * sector : Math.random() * Math.PI * 2;
+      const d = rand(minDist, PLACE_DISTANCE_MAX_M);
+      const P = new THREE.Vector3(eye.x - Math.sin(yaw) * d, h0 + rand(-HEIGHT_VARIATION_M, HEIGHT_VARIATION_M), eye.z - Math.cos(yaw) * d);
+      if (spotIsValid(P, eye, kept.concat(chosen), relaxed)) spot = P;
+    }
+    if (!spot) return null;
+    chosen.push(spot);
+  }
+  return chosen;
+}
+/** Gives every remaining marble at this location a spot (marbles placed earlier this session keep theirs). */
+function prepareSpots(relaxed = false) {
+  const missing = remainingSlots().filter((i) => !xr.placed.has(i));
+  if (!missing.length) return true;
+  const spots = pickAirSpots(missing.length, [...xr.placed.values()], relaxed);
+  if (!spots) return false;
+  missing.forEach((slot, k) => xr.placed.set(slot, spots[k]));
+  return true;
+}
+
+function placeMarblesXR(frame) {
+  clearMarbles();
+  // prepareSpots() has given each remaining marble a floating spot; marbles keep it for the whole session.
+  const slots = remainingSlots().filter((i) => xr.placed.has(i));
+  slots.forEach((slotIdx) => {
+    const base = xr.placed.get(slotIdx).clone();
+    const m = createMarble(slotIdx, S.round.slots[slotIdx].type, MARBLE_DIAMETER_M / 2, true);
+    m.root.position.copy(base);  // fixed point in the room, floating at about phone height
+    world.add(m.root);
+    S.marbles.push(m);
+    // Anchor each marble to the real world when the device supports anchors; otherwise it simply stays
+    // at its world-space position in the 'local' reference space.
+    if (xr.anchors && frame.createAnchor && window.XRRigidTransform) {
+      try {
+        frame.createAnchor(new XRRigidTransform({ x: base.x, y: base.y, z: base.z, w: 1 }), xr.refSpace)
+          .then((anchor) => { if (m.collected || !S.marbles.includes(m)) anchor.delete(); else m.anchor = anchor; })
+          .catch(() => {});
+      } catch (e) { /* anchors unsupported: the 'local' space still keeps marbles in place */ }
+    }
+  });
+}
+
+function onXRSelect(e) {
+  if (S.phase !== 'playing') return;
+  const pose = e.frame.getPose(e.inputSource.targetRaySpace, xr.refSpace);
+  if (!pose) return;
+  // Turn the tap ray into a screen point, then use the same picking as camera mode.
+  const o = pose.transform.position, q = pose.transform.orientation;
+  const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(new THREE.Quaternion(q.x, q.y, q.z, q.w));
+  const point = new THREE.Vector3(o.x, o.y, o.z).add(dir);
+  const s = projectToScreen(point, { x: 0, y: 0, depth: 0 });
+  if (s) handleTap(s.x, s.y);
+}
+
+function onXREnd() {
+  D.log('AR session ended');
+  document.documentElement.classList.remove('xr-active');
+  xr.hitSources.forEach((s) => { try { s.cancel(); } catch (e) { /* ignore */ } });
+  xr.hitSources = [];
+  xr.session = null;
+  xr.pendingPlacement = false;
+  clearMarbles();
+  stopGameLoop();
+  resetLighting();
+  occl.uDepthEnabled.value = 0;
+  xr.lightProbe = null; xr.depth = false;
+  renderer.xr.enabled = false;
+  scanPoints.visible = surfaceRing.visible = reticle3D.visible = false;
+  S.mode = null;
+  saveRound();
+  onResize();
+  if (S.phase === 'won') { hud.hidden = true; showWin(); }
+  else if (S.phase !== 'error') { S.phase = 'start'; showStart('AR session ended. Your progress is saved.'); }
+}
+
+// =====================================================================
+//  MODE 2: Camera feed + device orientation (iPhone Safari, etc.)
+// =====================================================================
+let stream = null;
+const orient = { alpha: 0, beta: 0, gamma: 0, has: false };
+const drag = { yaw: 0, pitch: 0 };
+let dragLook = false, sensorListening = false, firstSensorSample = true;
+const targetQ = new THREE.Quaternion();
+const _euler = new THREE.Euler();
+const _zee = new THREE.Vector3(0, 0, 1);
+const _q0 = new THREE.Quaternion();
+const _q1 = new THREE.Quaternion(-Math.sqrt(0.5), 0, 0, Math.sqrt(0.5)); // -90° about X: camera looks out of the back of the phone
+
+function onDeviceOrientation(e) {
+  if (e.alpha == null && e.beta == null) return;
+  orient.alpha = e.alpha || 0; orient.beta = e.beta || 0; orient.gamma = e.gamma || 0;
+  orient.has = true;
+}
+
+async function startCameraMode({ noCamera = false } = {}) {
+  S.mode = 'camera';
+  D.set('mode', noCamera ? 'fallback (no camera)' : 'fallback (camera + orientation)');
+  // iOS 13+: motion permission must be requested first, while we are still inside the tap.
+  let motion = 'granted';
+  const DOE = window.DeviceOrientationEvent;
+  if (DOE && typeof DOE.requestPermission === 'function') {
+    try { motion = await DOE.requestPermission(); } catch (e) { motion = 'denied'; }
+  }
+
+  if (!noCamera) {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return showError('unsupported');
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
+      });
+    } catch (e) {
+      stopCamera();
+      const kind = (e.name === 'NotAllowedError' || e.name === 'SecurityError') ? 'camera-denied'
+        : (e.name === 'NotFoundError' || e.name === 'OverconstrainedError') ? 'no-camera'
+        : e.name === 'NotReadableError' ? 'camera-busy' : 'camera-error';
+      return showError(kind, e);
+    }
+    video.srcObject = stream;
+    video.style.display = 'block';
+    video.onloadedmetadata = updateCameraFov;
+    try { await video.play(); } catch (e) { /* autoplay hiccup; it is muted so it will start */ }
+    gridSphere.visible = false;
+  } else {
+    stopCamera();
+    gridSphere.visible = true;
+  }
+
+  // Motion sensors
+  if (!sensorListening) { window.addEventListener('deviceorientation', onDeviceOrientation); sensorListening = true; }
+  orient.has = false; firstSensorSample = true; dragLook = false;
+  camera.position.set(0, 0, 0);
+  camera.quaternion.identity();
+  drag.yaw = 0; drag.pitch = 0;
+  updateCameraFov();
+
+  clearMarbles();
+  startGameLoop();
+
+  toast(noCamera ? 'Virtual mode: no camera, marbles float around you.'
+                 : 'Camera mode: turn and tilt your phone to look around your room.', 3500);
+  startRound('start'); // spawn the marbles around the player
+  setTimeout(() => {
+    if (S.mode !== 'camera') return;
+    if (!orient.has) {
+      dragLook = true;
+      toast(motion === 'denied' ? 'Motion access was denied. Drag the screen to look around.'
+                                : 'No motion sensor found. Drag the screen to look around.', 3500);
+    }
+    if (S.phase === 'playing') toast(`Hold the ring on a marble for ${FOCUS_TIME_MS / 1000} s, or tap it.`, 3500);
+  }, 1500);
+}
+
+function stopCamera() {
+  if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
+  video.srcObject = null;
+  video.style.display = 'none';
+}
+
+/** Places marbles at fixed directions around the player (saved per round so a reload keeps them). */
+function spawnCameraMarbles() {
+  S.round.slots.forEach((s, i) => {
+    if (s.collected) return;
+    const m = createMarble(i, s.type, MARBLE_RADIUS_CAMERA, false);
+    const cp = Math.cos(s.pitch);
+    m.root.position.set(-Math.sin(s.yaw) * cp * s.dist, Math.sin(s.pitch) * s.dist, -Math.cos(s.yaw) * cp * s.dist);
+    world.add(m.root);
+    S.marbles.push(m);
+  });
+}
+
+/** Turns device orientation (or drag input) into the 3D camera's rotation, with light smoothing. */
+function updateSensorCamera(dtMs) {
+  if (orient.has && !dragLook) {
+    const screenAngle = ((screen.orientation && screen.orientation.angle) ?? window.orientation ?? 0) * DEG;
+    _euler.set(orient.beta * DEG, orient.alpha * DEG, -orient.gamma * DEG, 'YXZ');
+    targetQ.setFromEuler(_euler).multiply(_q1).multiply(_q0.setFromAxisAngle(_zee, -screenAngle));
+    if (firstSensorSample) { camera.quaternion.copy(targetQ); firstSensorSample = false; }
+    else camera.quaternion.slerp(targetQ, 1 - Math.pow(0.6, dtMs / 16.7)); // smooth out sensor jitter
+  } else {
+    camera.quaternion.setFromEuler(_euler.set(drag.pitch, drag.yaw, 0, 'YXZ'));
+  }
+  camera.updateMatrixWorld();
+}
+
+/** Matches the 3D field of view to the visible part of the (cropped) camera video. */
+function updateCameraFov() {
+  const W = innerWidth, H = innerHeight;
+  let vfov = 62;
+  if (video.videoWidth && stream) {
+    const vw = video.videoWidth, vh = video.videoHeight;
+    const focal = (Math.max(vw, vh) / 2) / Math.tan((CAMERA_LONG_SIDE_FOV_DEG * DEG) / 2);
+    const scale = Math.max(W / vw, H / vh);         // object-fit: cover
+    vfov = (2 * Math.atan((H / scale / 2) / focal)) / DEG;
+  }
+  camera.fov = clamp(vfov, 30, 100);
+  camera.aspect = W / H;
+  camera.updateProjectionMatrix();
+}
+
+// Touch input in camera mode: tap to collect; drag to look around when there are no sensors.
+let ptr = null;
+canvas.addEventListener('pointerdown', (e) => {
+  ptr = { id: e.pointerId, x: e.clientX, y: e.clientY, lx: e.clientX, ly: e.clientY, t: performance.now(), moved: 0 };
+});
+canvas.addEventListener('pointermove', (e) => {
+  if (!ptr || e.pointerId !== ptr.id) return;
+  const dx = e.clientX - ptr.lx, dy = e.clientY - ptr.ly;
+  ptr.moved += Math.abs(dx) + Math.abs(dy);
+  ptr.lx = e.clientX; ptr.ly = e.clientY;
+  if (dragLook) {
+    drag.yaw += dx * 0.005;
+    drag.pitch = clamp(drag.pitch + dy * 0.005, -1.45, 1.45);
+  }
+});
+canvas.addEventListener('pointerup', (e) => {
+  if (!ptr || e.pointerId !== ptr.id) return;
+  if (ptr.moved < 12 && performance.now() - ptr.t < 600) handleTap(e.clientX, e.clientY);
+  ptr = null;
+});
+canvas.addEventListener('pointercancel', () => { ptr = null; });
+
+// =====================================================================
+//  Buttons, page events, start-up
+// =====================================================================
+startBtn.addEventListener('click', () => startGame(false));
+newGameBtn.addEventListener('click', () => startGame(true));
+noArBtn.addEventListener('click', () => startGame(false));
+againBtn.addEventListener('click', playAgain);
+
+$('#errRetry').addEventListener('click', () => startGame(false));
+$('#errBack').addEventListener('click', goHome);
+$('#errAlt').addEventListener('click', () => {
+  ensureAudio();
+  hideScreens();
+  buildSlots();
+  // From an AR problem, "Play without AR" still uses the camera; from a camera problem, play without it.
+  const kind = $('#errAlt').dataset.kind;
+  S.wantAR = false;
+  S.phase = 'starting';
+  startCameraMode({ noCamera: kind !== 'xr-denied' && kind !== 'xr-failed' });
+});
+
+// Restart needs two taps (a confirm dialog can't be shown inside AR).
+let restartTimer = 0;
+restartBtn.addEventListener('click', () => {
+  if (restartBtn.classList.contains('armed')) {
+    clearTimeout(restartTimer);
+    restartBtn.classList.remove('armed');
+    restartBtn.textContent = '↻';
+    if (['playing', 'scanning', 'placing'].includes(S.phase)) playAgain();
+    return;
+  }
+  // The button keeps its size (so it never grows over the score bar); a toast explains the second tap.
+  restartBtn.classList.add('armed');
+  clearToasts();
+  toast('Tap ↻ again to restart the round', 2300);
+  restartTimer = setTimeout(() => { restartBtn.classList.remove('armed'); }, 2500);
+});
+
+function onResize() {
+  if (!renderer || renderer.xr.isPresenting) return;
+  renderer.setSize(innerWidth, innerHeight, false);
+  if (S.mode === 'camera') updateCameraFov();
+  else { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); }
+}
+addEventListener('resize', onResize);
+addEventListener('orientationchange', () => setTimeout(onResize, 300));
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) saveRound();
+  else if (S.mode === 'camera' && stream) video.play().catch(() => {});
+});
+addEventListener('pagehide', saveRound);
+
+// Block pinch-zoom and double-tap zoom (iOS ignores user-scalable=no).
+document.addEventListener('gesturestart', (e) => e.preventDefault());
+document.addEventListener('dblclick', (e) => e.preventDefault());
+document.addEventListener('touchmove', (e) => { if (e.touches.length > 1) e.preventDefault(); }, { passive: false });
+
+/** Detects which mode this device supports and shows it on the start screen. */
+async function detectSupport() {
+  support.secure = window.isSecureContext !== false;
+  support.camera = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+  try {
+    support.xr = !!(navigator.xr && await navigator.xr.isSessionSupported('immersive-ar'));
+    D.set('immersive-ar supported', navigator.xr ? support.xr : 'no navigator.xr');
+  } catch (e) { support.xr = false; D.set('immersive-ar supported', 'ERROR ' + errText(e)); }
+  D.set('iOS device', isIOS ? 'yes' : 'no');
+
+  modeBadge.className = 'badge';
+  if (!support.webgl) { modeBadge.classList.add('bad'); modeText.textContent = '3D graphics (WebGL) unavailable'; }
+  else if (!support.secure) { modeBadge.classList.add('bad'); modeText.textContent = 'Needs HTTPS to use the camera'; }
+  else if (support.xr && isIOS) { modeBadge.classList.add('xr'); modeText.textContent = 'Full AR (App Clip): marbles float at fixed spots in your room'; }
+  else if (support.xr) { modeBadge.classList.add('xr'); modeText.textContent = 'Full AR: marbles float at fixed spots in your room'; }
+  else if (isIOS) { modeBadge.classList.add('cam'); modeText.textContent = 'On iPhone, AR opens in the Needle Go App Clip'; }
+  else { modeBadge.classList.add('bad'); modeText.textContent = 'Full AR is not available in this browser'; }
+
+  support.ready = true;
+  startBtn.disabled = false;
+  renderStartButtons();
+}
+
+// The Needle App Clip fires 'sessiongranted' on navigator.xr when an AR session may start without a tap.
+// Start the same WebXR game right away (requestSession is called synchronously inside the event).
+if (navigator.xr && typeof navigator.xr.addEventListener === 'function') {
+  navigator.xr.addEventListener('sessiongranted', () => {
+    D.set('sessiongranted', 'fired');
+    if (xr.session || S.busy || !support.webgl) return;
+    support.xr = true;
+    support.ready = true;
+    S.wantAR = true;
+    D.set('mode', 'WebXR (sessiongranted)');
+    if (!S.round || S.round.finished || allCollected()) newRound();
+    buildSlots();
+    hideScreens();
+    beginSession();
+  });
+}
+
+// Keep the label / hint / toast stack just under the score bar, whatever its height.
+function layoutHud() {
+  const r = hud.hidden ? null : hud.getBoundingClientRect();
+  overlayEl.style.setProperty('--hud-bottom', r && r.height ? r.bottom + 'px' : 'env(safe-area-inset-top, 0px)');
+}
+if (window.ResizeObserver) new ResizeObserver(layoutHud).observe(hud);
+addEventListener('resize', layoutHud);
+
+S.round = loadRound();
+if (S.round) buildSlots();
+showStart();
+detectSupport();
+window.__marbleReady = true;
+</script>
+
+<!-- If the 3D engine fails to load (offline, very old browser), say so instead of a dead Start button. -->
+<script>
+  setTimeout(function () {
+    if (window.__marbleReady) return;
+    document.getElementById('modeText').textContent = 'Could not load the 3D engine';
+    document.getElementById('modeBadge').className = 'badge bad';
+    document.getElementById('startMsg').textContent =
+      'Check your internet connection or update your browser (iOS 16.4+ / recent Chrome), then reload.';
+  }, 10000);
+</script>
+</body>
+</html>
